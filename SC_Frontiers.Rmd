@@ -1,0 +1,2770 @@
+---
+title: "Steep Cone Temporal Spatial Study"
+author: "Kalen Rasmussen"
+date: "2/3/2023"
+output: html_document
+---
+
+---To Remove demux. from name to make naming in dada2 easier, remove first 6 characters in the name using terminal. 
+```{bash}
+for f in *; do mv "$f" "${f:6}"; done
+```
+
+using cutadapt to trim primers. In terminal, cutadapt is located in the cutadaptenv, v3.4
+```{bash}
+conda activate cutadaptenv
+cutadapt --version
+```
+
+---Dada2 Processing and Primer trimming with cutadapt
+```{r}
+library(Matrix)
+packageVersion("Matrix")
+library(ShortRead)
+packageVersion("ShortRead")
+library(dada2)
+packageVersion("dada2")
+library(Biostrings)
+packageVersion("Biostrings")
+```
+
+```{r}
+path <- '/Users/kalen/Documents/YNP_Project/16S/SC_Overall/demultiplexed/'
+files <- list.files(path)
+```
+
+Now I am going to import and sort the forward and reverse reads, extract the sample names, and make a dataframe of them, and concatenate my path to each created R object.
+```{r}
+Fr <- sort(list.files(path, pattern=".pair1.fastq.gz", full.names = TRUE))
+Rr <- sort(list.files(path, pattern=".pair2.fastq.gz", full.names = TRUE))
+sample.names <- sapply(strsplit(basename(Fr), ".pair1."), '[', 1)
+```
+
+Inputting forward and reverse primer sequences
+```{r}
+FWD <- "CCGTAAAACGACGGCCAGTCCGTGYCAGCMGCCGCGGTAA" #CCGTAAAACGACGGCCAGTCCGTGYCAGCMGCCGCGGTAA
+REV <- "CCGYCAATTYMTTTRAGTTT" #CCGYCAATTYMTTTRAGTTT
+```
+
+verify the presence and orientation of these primers in the data.
+```{r}
+allOrients <- function(primer) {
+    # Create all orientations of the input sequence
+    require(Biostrings)
+    dna <- DNAString(primer)  # The Biostrings works w/ DNAString objects rather than character vectors
+    orients <- c(Forward = dna, Complement = complement(dna), Reverse = reverse(dna), 
+        RevComp = reverseComplement(dna))
+    return(sapply(orients, toString))  # Convert back to character vector
+}
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+FWD.orients
+```
+
+number of times the primers appear in the forward and reverse read, while considering all possible primer orientations
+```{r}
+primerHits <- function(primer, fn) {
+    # Counts number of reads in which the primer is found
+    nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+    return(sum(nhits > 0))
+}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = Fr[[5]]), 
+    FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = Rr[[5]]), 
+    REV.ForwardReads = sapply(REV.orients, primerHits, fn = Fr[[5]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = Rr[[5]]))
+```
+FWD.ForwardReads and REV.ReverseReads are similar in number for the forward orientation so they should be correct. 
+
+Moving into cutadapt to remove primers (v3.4)
+```{r}
+#make sure cutadapt is working.  Change path below as necessary.
+cutadapt <- "/opt/miniconda3/envs/cutadaptenv/bin/cutadapt"
+system2(cutadapt, args = "--version") # Run shell commands from R
+```
+
+double check that the path is correct
+```{r}
+path.cut <- file.path(path, "cutadapt")
+if(!dir.exists(path.cut)) dir.create(path.cut)
+Fr.cut <- file.path(path.cut, basename(Fr))
+Rr.cut <- file.path(path.cut, basename(Rr))
+
+FWD.RC <- dada2:::rc(FWD)
+REV.RC <- dada2:::rc(REV)
+# Trim FWD and the reverse-complement of REV off of R1 (forward reads)
+R1.flags <- paste("-g", FWD, "-a", REV.RC) 
+# Trim REV and the reverse-complement of FWD off of R2 (reverse reads)
+R2.flags <- paste("-G", REV, "-A", FWD.RC) 
+# Run Cutadapt
+for(i in seq_along(Fr)) {
+  system2(cutadapt, args = c(R1.flags, R2.flags, "-n", 1, "-j", 0, "--max-n", 0, "-q", 10, 
+                             "-o", Fr.cut[i], "-p", Rr.cut[i], # output files
+                             Fr[i], Rr[i])) # input files
+}
+```
+
+Check for prevalence
+```{r}
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = Fr.cut[[5]]), 
+    FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = Rr.cut[[5]]), 
+    REV.ForwardReads = sapply(REV.orients, primerHits, fn = Fr.cut[[5]]), 
+    REV.ReverseReads = sapply(REV.orients, primerHits, fn = Rr.cut[[5]]))
+```
+Sequences that weren't trimmed are mostly likely due to chimera's which will be filtered out in dada2. 
+
+"importing" cutadapt trimmed sequences in R secession with names
+```{r}
+path.cut <- "/Users/kalen/Documents/YNP_Project/16S/SC_Overall/demultiplexed/cutadapt/"
+cutFr <- sort(list.files(path.cut, pattern = ".pair1.fastq.gz", full.names = TRUE))
+cutRr <- sort(list.files(path.cut, pattern = ".pair2.fastq.gz", full.names = TRUE))
+get.sample.name <- function(fname) strsplit(basename(fname), ".pair")[[1]][1]
+sample.names <- unname(sapply(cutFr, get.sample.name))
+head(sample.names)
+```
+
+Next I am going to examine the sequencing quality profiles for both the forward and the reverse in order to determine where I need to trim based on quality. I am going to examine the 10 forward and reverse sequencing. One can also use FastQC to perform this step.
+```{r}
+plotQualityProfile(cutFr[1:5])
+plotQualityProfile(cutRr[1:5])
+```
+For the forward reads it appears that the quality significantly diminishes (below Q30) after 200 bp and for the reverse never really drops off so I don't necessarily have to trim these sequences too much. It is important to know that for the way we perform 16S sequencing in our lab using the 515_Y and 926 primers and two step barcoding that after initial trimming the forward reads are ~200 bp and the reverse are ~230 pb, so the errors in the graphs after those bp are inconsequential for this set up. 
+
+Now, I am going to make a new folder that is created in the pwd, so that when I filter and trim the reads, they will be automatically sorted into this folder. 
+```{r}
+filtFr <- file.path(path.cut, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRr <- file.path(path.cut, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+```
+
+Filter and trimming. I am trimming the forward reads to 200 and the reverse reads at 230. The 230 isn't really a trim at this point, but by specifying to, dada2 will automatically throw out any reads that are below this number, because all the reads must be the same length.
+```{r}
+out <- filterAndTrim(cutFr, filtFr, cutRr, filtRr, truncLen = c(195, 230), maxN = 0, maxEE = c(2,2), truncQ = 2, rm.phix = TRUE, compress = TRUE, multithread = TRUE)
+
+View(out)
+```
+
+Next, I'm going to examine the error rates of the sequences.
+```{r}
+errF <- learnErrors(filtFr, multithread = TRUE)
+errR <- learnErrors(filtRr, multithread = TRUE)
+```
+
+To examine the errors:
+```{r}
+plotErrors(errF, nominalQ = TRUE)
+plotErrors(errR, nominalQ = TRUE)
+```
+
+Once, we have learned the errors we can begin the dereplication process.
+Dereplicate the forward and reverse reads and name the dereplicated R objects by their sample names
+```{r}
+derepFr <- derepFastq(filtFr, verbose = TRUE)
+derepRr <- derepFastq(filtRr, verbose = TRUE)
+names(derepFr) <- sample.names
+names(derepRr) <- sample.names
+```
+
+We can now run the sample inference algorithm on the data and view the output forward read object of the first sample
+```{r}
+ptm <- proc.time()
+dadaFr <- dada(derepFr, err = errF, multithread = TRUE)
+dadaRr <- dada(derepRr, err = errR, multithread = TRUE)
+dadaFr[[5]]
+proc.time() - ptm
+```
+Output for sequence 5 = 125 sequence variants were inferred from 7858 input unique sequences.
+
+
+Now, merge the paired end reads to one another, and view the output data.frame 55
+```{r}
+#merged <- mergePairs(dadaFr, derepFr, dadaRr, derepRr, verbose=TRUE, returnRejects=TRUE) #for later Euk processings
+merged <- mergePairs(dadaFr, derepFr, dadaRr, derepRr, verbose = TRUE) #is only doing Bac and Arch
+head(merged[[5]])
+```
+
+We can now construct the amplicon sequence variant table (This is the dada2 version of an OTU table) and view the distribution of sequnce lenths.
+```{r}
+seqtab <- makeSequenceTable(merged)
+dim(seqtab)
+table(nchar(getSequences(seqtab)))
+```
+We can see that we have 20638 ASVs in this case. The total sequence length for our primers (before primer (40,20bp) and barcode (12bp) removal) is around 423bp. So after removing barcodes and primers the length is around 354bp. We also know that we trimmed to 200 and 230 bp for the forward and reverse reads, so the maximum length possible is ~427, and a 230 bp sequence would indicate a complete overlap. And the lengths of all these ASVs are from 230 to 412 bp which correspond to a larger range than our targeted 16S rRNA gene V4 amplicon. The erraneous reads could be errors or chimeric, which would be removed later on in the pipeline. 
+I blasted a random ASVs across the length of ranges and many of the end lengths were contamination or 18S correlated. More info in Controls_Overall Analysis.
+Moving forward, I am going to plot a histogram and trim off both tails with a broad range. Anything else that slips through will be filtered out as unclassified during taxa assignment since it would be 18S or thrown out in phyloseq when I trim out mitochondria and chloroplast sequences.
+
+Histogram
+```{r}
+library(ggplot2)
+histogram = as.data.frame(table(nchar(getSequences(seqtab))))
+ggplot(histogram, aes(x=Var1,y=Freq))+geom_bar(stat="identity") + theme_bw() + theme(axis.text.x = element_text(angle=90,size=4))
+```
+Almost all fall between 366 and 378
+
+Here I am trimming the sequence table to only include merged sequences that fall within my expected range and don't exclude any possibilities based upon blast results of samples at different lengths. 
+```{r}
+seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% 352:405]
+dim(seqtab2)
+table(nchar(getSequences(seqtab2)))
+```
+So here we can see that 19153 ASVs are remaining and the range of sequence lengths is more in line with one it could possibly, with >95% of reads in the range of 368 to 378bp. Any sequences that are erroneous will be filter out later as we move through processing.  
+
+Now we can remove all chimeras from the data set and view a table summary of the number of chimeric sequences compared to the total number of sequences.
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab2, method = 'consensus', multithread = TRUE, verbose = TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+```
+The algorithm identified 14574 bimeras out of 19153 sequences, which is ~76% of sequences (not uncommon for a majority of sequence varients to be removed, but is uncommon for major impact on number of total reads).... we do see that after accounting for abundance, chimeras accounted for 9% of sequences. 
+
+Examine and quantify the number of reads processed during each step as a method to check the viability of the work conducted. 
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <-cbind(out, sapply(dadaFr, getN), sapply(dadaRr, getN), sapply(merged, getN), rowSums(seqtab.nochim))
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
+looks ok, kept the majority of reads throughout the process and there was no one step that took out a large chunk of reads. Although the filtering removed many reads.
+
+Now we are going to assign taxonomy using the dada2 release silva database v138.
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim,'/Users/kalen/Documents/Bioinformatics/Silva_v138/silva_nr99_v138.1_train_set.fa.gz', multithread = TRUE ) 
+```
+
+Now we can assign species specific assignments based off of 100% similarity, and examine the taxonomic assignments.
+```{r}
+taxa <- addSpecies(taxa, '/Users/kalen/Documents/Bioinformatics/Silva_v138/silva_species_assignment_v138.1.fa.gz')
+taxa.print <- taxa
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+Looks good, no euk classifications. If desired this would be the point to build a phylogenetic tree.
+
+
+
+---Tree Construction (Bacteria/Archaea only)
+Load in required libraries for tree building. Will be using phanngorn to align the sequences and FastTree 2.1 to construct the phylogenetic tree. Could use phangorn for the entire process, but the tree construction with it is extremely memory and CPU intensive. One would want to use a server is possible.
+```{r}
+library(phangorn)
+library(DECIPHER)
+```
+
+Align sequences/ASVs. I have more processors than you so change the value below. 
+```{r, output=FALSE,message=FALSE}
+seqs <- getSequences(seqtab.nochim)
+names(seqs) <- seqs # This propagates to the tip labels of the tree
+alignment <- AlignSeqs(DNAStringSet(seqs), anchor=NA,verbose=FALSE, processors = 6)
+```
+
+Export Alignment. Get your alignment outta R and ready for fasttree. 
+```{r}
+#DNAStr = as(alignment, "DNAStringSet")
+writeXStringSet(alignment, file="/Users/kalen/Documents/YNP_Project/16S/SC_Overall/aligned/phangali.fa")
+```
+This was executed outside of the notebook through terminal
+```{bash}
+fasttree -gamma -gtr -nt /Users/kalen/Documents/YNP_Project/16S/SC_Overall/aligned/phangali.fa > bac_tree.tre
+```
+Unique: 4579/4579 Bad splits: 15/4576 Worst delta-LogLk 7.629
+
+Root tree prior to phyloseq input. This is to ensure all PCoA/RDA/Etc. analyses using unifrac are consistent.
+```{r}
+library(ape)
+```
+Defined outgroup selection from Phyloseq issue here- https://github.com/joey711/phyloseq/issues/597
+```{r}
+pick_new_outgroup <- function(tree.unrooted){
+    require("magrittr")
+    require("data.table")
+    require("ape") # ape::Ntip
+    # tablify parts of tree that we need.
+    treeDT <- 
+      cbind(
+        data.table(tree.unrooted$edge),
+        data.table(length = tree.unrooted$edge.length)
+      )[1:Ntip(tree.unrooted)] %>% 
+      cbind(data.table(id = tree.unrooted$tip.label))
+    # Take the longest terminal branch as outgroup
+    new.outgroup <- treeDT[which.max(length)]$id
+    return(new.outgroup)
+  }
+```
+
+```{r}
+bac.tre <- read.tree("/Users/kalen/Documents/YNP_Project/16S/SC_Overall/aligned/bac_tree.tre")
+```
+
+```{r}
+new.outgroup = pick_new_outgroup(bac.tre)
+bac.tre.rooted = ape::root(bac.tre, outgroup=new.outgroup, resolve.root=TRUE)
+```
+
+---Bringing in MetaData
+Next, I am going to load in all of my metadata in a long format. Here I am also making sure that all the Sample IDs are separated by "_" instead of ".", this is because when demultiplexing with sabre, the names only contain "." but when using adapterremoval2 to demultiplex periods are not accepted, and "_" must be used. So the reality is just make sure that in this step you match everything in terms of sample id, and match them to the sample.names objected created at the beginging of dada2 processing otherwise nothing will match or join properly when making your phyloseq object.
+```{r}
+samdf <- read.csv("~/Documents/YNP_Project/Analyte_Data_Raw/MetaData_Long/MetaData_mM_2021_6_1.csv", header = TRUE) #replace this csv with scRNA_melt.csv for RNA samples and sc_melt.csv for DNA samples.
+#make sure this metadata contains entries for all the controls.
+#rownames(samdf) <- samdf$Sample_ID #I am currently negating this, because I do it later after merging the two data.frames. If not merging do this for phyloseq
+samdf$X <- NULL
+samdf$DNA.only <- NULL
+samdf$DNA.Only <- NULL
+samdf$DNA...microscopy <- NULL
+samdf$NA. <- NULL
+samdf$Sample_ID <- chartr('.', '_', samdf$Sample_ID)
+tail(samdf)
+
+#converting all entered data to numerical values. 
+A <- c(10:101)
+for (i in A) {
+  samdf[,i]  <- as.numeric(as.character(samdf[,i]))
+}
+View(lapply(samdf, class))
+
+library(readxl)
+decontam_data <- read_excel("~/Documents/YNP_Project/16S/Decontam_data.xlsx")
+decontam_data$Sample_ID <- chartr('.', '_', decontam_data$Sample_ID)
+tail(decontam_data)
+```
+
+Now I want to combine the two dataframes based upon matching their Sample_ID
+```{r}
+samdf.merged <- merge(samdf, decontam_data, by = "Sample_ID")
+rownames(samdf.merged) <- samdf.merged$Sample_ID
+#View(samdf.merged)
+```
+
+
+---Decontam Package analysis for Bacteria and Archaea.
+```{r}
+library(phyloseq)
+library(decontam)
+library(ggplot2)
+```
+
+First need to construct a phyloseq object of the Steep Cone Sample set.
+```{r}
+library(phyloseq)
+SC.BA <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(samdf.merged), tax_table(taxa), phy_tree(bac.tre.rooted))
+SC.BA <- prune_samples(sample_sums(SC.BA) >= 1, SC.BA) #removing all samples with less than 1 read which helps downstream. Didn't remove any samples.
+SC.BA
+```
+
+Read in controls phyloseq object and combine it with the SC dataset. The controls dataset has been processed with dada2 and had gene copy normalization as shown here.
+```{r}
+psCon <- readRDS("/Users/kalen/Documents/YNP_Project/16S/Controls_Overall/Controls_Overall_BA.RDS")
+psCon <- prune_samples(sample_sums(psCon) >= 1, psCon) #removing all samples with less than 1 read which helps downstream. removed 7 samples
+ps <- merge_phyloseq(psCon, SC.BA) #merging the two phyloseq objects
+ps <- subset_samples(ps, Sample_ID != 'PCR_Neg_3_1') # this sampls has 0 reads, but for some reason isn't being removed.
+psCon
+SC.BA
+ps
+```
+
+I am going to go through the decontamination pipeline for the bacteria/archaea samples, which is the ps phyloseq object. 
+```{r}
+df <- as.data.frame(sample_data(ps)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Sample_or_Control)) + geom_point()
+```
+
+***Determining the contaminants based upon frequency and quantification values***:
+```{r}
+contamdf.freq <- isContaminant(ps, method="frequency", conc="quant_reading")
+head(contamdf.freq)
+table(contamdf.freq$contaminant)
+head(which(contamdf.freq$contaminant))
+```
+So based upon frequency, there are 97 ASV out of 5040 are being classified as a contaminant, with the most prevalent being the 162 most abundant ASV classified as a contaminant
+
+ok, now lets check the distribution of the top three ASVs and the most prevalent contaminant, of which #118 is a contaminant. 
+```{r}
+set.seed(100)
+plot_frequency(ps, taxa_names(ps)[c(1,2,3,80,118,151)], conc="quant_reading") + xlab("DNA Concentration (Qubit, ng/ul)") #118, 151 were flagged as contaminants
+```
+In this plot the dashed black line shows the model of a noncontaminant sequence feature for which frequency is expected to be independent of the input DNA concentration. The red line shows the model of a contaminant sequence feature. The results of this test appear to  be inconclusive since the frequency of many reads is below the models predictions and the contaminant fits are poor. 
+
+Plotting the contaminants to examine how other sequences flagged as contaminants adhere to the models.  
+```{r}
+plot_frequency(ps, taxa_names(ps)[sample(which(contamdf.freq$contaminant))], conc="quant_reading") +
+    xlab("DNA Concentration (Qubit, ng/uL)")
+```
+The some are clearly contaminants, but others are could be either. Again this shows that there may be some issues to due to overall frequencies of most reads being well below what this model is predicting. 
+
+Making a heatmap of the contaminants and their abundance in samples to see what ASVs are being flagged as contaminants based on frequency and in what samples.
+```{r}
+ps.freq <- prune_taxa(contamdf.freq$contaminant, ps)
+ps.freq <- prune_samples(sample_sums(ps.freq) >= 1, ps.freq)
+plot_heatmap(ps.freq, sample.label = "Old_naming", taxa.label = "Family", method = "unifrac")
+```
+Upon examining this heatmap one can see that some taxa have been flagged as contaminants that are thermophilic and they are being flagged in environmental samples where it makes sense for them to be and are probably not contaminants. Such as thermaceae. These are not extremely prevalent, but are false contaminant flags. 
+
+***Determining the contaminants based upon prevalence in negative controls vs real samples***:
+```{r}
+sample_data(ps)$is.neg <- sample_data(ps)$Sample_or_Control == "Control Sample"
+contamdf.prev <- isContaminant(ps, method="prevalence", neg="is.neg", threshold = 0.16)
+table(contamdf.prev$contaminant)
+head(which(contamdf.prev$contaminant))
+```
+For this approach I used a threshold of 0.16, which is close to the default value. 
+This resulted in the identification of 77 ASVs as contaminants, with the 44th most  abundant ASV being classified as a contaminant. I iterated with thresholds higher than this number, but above a threshold of 0.16 known thermophilic ASVs (such as thermocrinis and tepidomonas) were being flagged as contaminants in environmental samples. 
+
+```{r}
+# Make phyloseq object of presence-absence in negative controls and true samples
+ps.pa <- transform_sample_counts(ps, function(abund) 1*(abund>0))
+ps.pa.neg <- prune_samples(sample_data(ps.pa)$Sample_or_Control == "Control Sample", ps.pa)
+ps.pa.pos <- prune_samples(sample_data(ps.pa)$Sample_or_Control == "True Sample", ps.pa)
+# Make data.frame of prevalence in positive and negative samples
+df.pa <- data.frame(pa.pos=taxa_sums(ps.pa.pos), pa.neg=taxa_sums(ps.pa.neg), contaminant=contamdf.prev$contaminant)
+ggplot(data=df.pa, aes(x=pa.neg, y=pa.pos, color=contaminant)) + geom_point() + xlab("Prevalence (Negative Controls)") + ylab("Prevalence (True Samples)")
+```
+Basically, the blue colored ones have been denoted at contaminant samples based upon prevalence, and red are true samples. However, looking at the graph, false samples should bunch on the left/upper left. Not as clean break between  the contaminants (blue) and the true sequences (red).  There is a decent amount of overlap where they join. 
+
+Making a heatmap of the contaminants and their abundance in samples to see what ASVs are being flagged as contaminants based on prevalence and in what samples.
+```{r}
+ps.prev <- prune_taxa(contamdf.prev$contaminant, ps)
+ps.prev <- prune_samples(sample_sums(ps.prev) >= 1, ps.prev)
+plot_heatmap(ps.prev, sample.label = "Old_naming", taxa.label = "Genus", method = "unifrac")
+#print(plot_heatmap(ps.prev, sample.label = "Old_naming", taxa.label = "Genus", method = "unifrac"))
+```
+
+***I am now going to redo this, but with a combined method so as to remove as many contaminants as possible.***
+```{r}
+#contamdf.comb <- isContaminant(ps, method= "minimum", neg="is.neg", conc="quant_reading") # for minimum and combined
+contamdf.comb <- isContaminant(ps, method="either", neg="is.neg", threshold = c(0.1, 0.16), conc="quant_reading")
+#contamdf.comb <- isContaminant(ps, method="combined", neg="is.neg", threshold = 0.5, conc="quant_reading")
+table(contamdf.comb$contaminant)
+head(which(contamdf.comb$contaminant))
+```
+The both method only identified 0 contaminants. The combined method identified 40 contaminants, but thermus was one of them and was being flagged in environmental samples. The minimum method identified 80 contaminants some of which were thermus. Using the 'either', with thresholds 0.1 and 0.16, method identified (130) all the contaminants based on frequency and prevalence, which began to flag thermocrinis in many environmental samples.
+
+Making a heatmap of the contaminants and their abundance in samples to see what ASVs are being flagged as contaminants based on either and in what samples.
+```{r}
+ps.comb <- prune_taxa(contamdf.comb$contaminant, ps)
+ps.comb <- prune_samples(sample_sums(ps.comb) >= 1, ps.comb)
+plot_heatmap(ps.comb, sample.label = "Old_naming", taxa.label = "Genus", method = "unifrac")
+```
+
+###Moving forward with the prevalence method. The results from this method at the 0.16 threshold maximixed the number of identified contaminants without flagging any known legitimate environmental sequences.###
+Now I am going to remove all of the ASVs that have been identified as contaminants from my dataset (78), and then move forward with my cleaned pyloseq object into gene count normalization. This is using the prevelence method at a threshold of 0.17. 
+```{r}
+ps
+ps.noncontam <- prune_taxa(!contamdf.prev$contaminant, ps)
+ps.noncontam
+ps.noncontam <- prune_samples(sample_sums(ps.noncontam) >= 1, ps.noncontam) #this removes all samples with less than 1 reads, which is vital for downstream processing. This removed 3 controls that had 0 samples after contaminant removal. 
+ps.noncontam
+```
+
+Removing all the controls from the samples set because they are no longer needed for this analysis. I have a different workbook for all the controls that I can use to examine taxa present in positives and negatives. I am also going to remove any potential non bacteria/archaea reads that may be present in the dataset. 
+```{r}
+Overall.BA <- subset_taxa(ps.noncontam, (Kingdom != "Eukaryota")&(Class != "Chloroplast")&(Family != "Mitochondria"))
+Overall.BA <- subset_samples(Overall.BA, (Sample_Type != 'Control')&(Sample_ID  != c('YNP179', 'YNP250', 'YNP339'))) #also removes the swab controls
+Overall.BA
+```
+
+---Gene copy number normalization through Qiime2 and using Qiime2 plug-in GCN-norm (https://github.com/Jiung-Wen/q2-gcn-norm) to copy number normalize the ASV table. And phyloseq object construction
+Moving forward with the decontam filtered phyloseq object (Overall.BA). First I am going to remove the samples that are cDNA of rRNA from the samples. The cDNA samples are of activity and are not normalized by gene copy number. 
+```{r}
+SC_DNA <- subset_samples(Overall.BA, Amplicon != 'rRNA')
+SC_RNA <- subset_samples(Overall.BA, Amplicon == 'rRNA')
+SC_DNA #will perform gene copy number normalization of this data set.
+SC_RNA
+```
+
+Build a necessary function
+```{r}
+#Just to build out the function to convert to a qiime2 object
+phyloseq2qiime2<-function(physeq){
+  #take a phyloseq object,check for individual parts, write to files ready for qiime2 upload
+  library(phyloseq)
+  library(biomformat)
+  library(ape)
+  library(Biostrings)
+  library(dada2)
+  library(qiime2R)
+  if(packageVersion("biomformat") < "1.7") {
+    stop("This will only work with biomformat version > 1.7")
+  }
+  ps_name <-deparse(substitute(physeq))
+  taxa_are_rows_logical<-taxa_are_rows(physeq)
+  #write OTU table to biom file
+  if(is.null(access(physeq,"otu_table"))==FALSE){
+    if(taxa_are_rows_logical==TRUE) {
+      otu<-as(otu_table(physeq),"matrix")
+      otu_biom<-make_biom(data=otu)
+      write_biom(otu_biom,biom_file=paste0(ps_name,"_features-table.biom"))
+      print(paste0("Writing feature table to ",ps_name,"_feature-table.biom"))
+    } else if (taxa_are_rows_logical==FALSE) {
+      otu<-t(as(otu_table(physeq),"matrix"))
+      otu_biom<-make_biom(data=otu)
+      write_biom(otu_biom,biom_file=paste0(ps_name,"_feature-table.biom"))
+      print(paste0("Writing feature table to ",ps_name,"_feature-table.biom"))
+    }
+  }
+  #write sample data (metadata) to tsv
+  if(is.null(access(physeq,"sam_data"))==FALSE){
+    colnames(sample_data(physeq))[1]<-'id'
+    write.table(sample_data(physeq),file=paste0(ps_name,"_sample-metadata.txt"), 
+                sep="\t", row.names=FALSE, col.names=TRUE, quote=FALSE)
+    print(paste0("Writing sample metadata to ",ps_name,"_sample-metadata.txt"))
+  }
+  #write taxonomy table to qiime2 formatted taxonomy
+  if(is.null(access(physeq,"tax_table"))==FALSE){
+    tax<-as(tax_table(physeq),"matrix")
+    tax_cols <- colnames(tax)
+    tax<-as.data.frame(tax)
+    tax$taxonomy<-do.call(paste, c(tax[tax_cols], sep="; ")) #standard script does not have space after semicolon
+    for(co in tax_cols) tax[co]<-NULL
+    write.table(tax, file=paste0(ps_name,"_tax.txt"), quote=FALSE, col.names=FALSE, sep="\t")
+    print(paste0("Writing taxonomy table to ",ps_name,"_tax.txt"))
+  }
+  #write phylogenetic tree to newick formwat
+  if(is.null(access(physeq,"phy_tree"))==FALSE){
+    if(is.rooted(phy_tree(physeq))==TRUE) {
+      ape::write.tree(phy_tree(physeq),file=paste0(ps_name,"_tree-rooted.newick"))
+      print(paste0("Writing rooted tree to ",ps_name,"_tree-rooted.newick"))
+    } else if (is.rooted(phy_tree(physeq))==FALSE) {
+      ape::write.tree(phy_tree(physeq),file=paste0(ps_name,"_tree-unrooted.newick"))
+      print(paste0("Writing unrooted tree to ",ps_name,"_tree-unrooted.newick"))
+    }      
+  }
+  #write representative sequences to fasta format
+  if(is.null(access(physeq,"refseq"))==FALSE){
+    writeXStringSet(refseq(physeq),filepath=paste0(ps_name,"_ref-seqs.fasta"))
+    print(paste0("Writing reference sequences to FASTA file ",ps_name,"_ref-seqs.fasta"))
+  } else if (taxa_are_rows_logical==FALSE && unique(grepl("[^ATCG]",colnames(otu_table(physeq)),ignore.case=TRUE) == FALSE)) {
+    uniquesToFasta(t(otu), fout=paste0(ps_name,"_ref-seqs.fasta"), ids=rownames(otu))
+    print(paste0("Writing reference sequences to FASTA file ",ps_name,"_ref-seqs.fasta"))      
+  } else if (taxa_are_rows_logical==TRUE && unique(grepl("[^ATCG]",rownames(otu_table(physeq)),ignore.case=TRUE) == FALSE)) {
+    uniquesToFasta(otu, fout=paste0(ps_name,"_ref-seqs.fasta"), ids=rownames(otu))
+    print(paste0("Writing reference sequences to FASTA file ",ps_name,"_ref-seqs.fasta"))    
+  }
+}
+```
+
+```{r}
+setwd("/Users/kalen/Documents/YNP_Project/16S/SC_Overall/copy_norm") #changing wd, output files will be placed here
+#must make it look like a green genes table
+tax_table(SC_DNA)@.Data[,1]<-paste0("k__",tax_table(SC_DNA)@.Data[,1])
+tax_table(SC_DNA)@.Data[,2]<-paste0("p__",tax_table(SC_DNA)@.Data[,2])
+tax_table(SC_DNA)@.Data[,3]<-paste0("c__",tax_table(SC_DNA)@.Data[,3])
+tax_table(SC_DNA)@.Data[,4]<-paste0("o__",tax_table(SC_DNA)@.Data[,4])
+tax_table(SC_DNA)@.Data[,5]<-paste0("f__",tax_table(SC_DNA)@.Data[,5])
+tax_table(SC_DNA)@.Data[,6]<-paste0("g__",tax_table(SC_DNA)@.Data[,6])
+tax_table(SC_DNA)@.Data[,7]<-paste0("s__",tax_table(SC_DNA)@.Data[,7])
+phyloseq2qiime2(SC_DNA) #will write 4 files to working directory. .biom, .fasta, .txt, and .newick files will be outputs
+```
+
+did this section in terminal bc could get it to work through R
+```{bash}
+#source qiime2 from anaconda, import OTU table
+conda activate qiime2-2021.2
+#cd to folder containing files. 
+qiime tools import --input-path SC_DNA_feature-table.biom --type FeatureTable[Frequency] --input-format BIOMV100Format --output-path table_SC_DNA.qza
+```
+
+```{r eval=FALSE, include=FALSE}
+###############################################################################
+#not run, but if you want to import the tax table (created above) and look at it you do it here.
+##############################################################################
+SVs<-read_qza("/Users/kalen/Documents/YNP_Project/16S/SC_Overall/copy_norm/taxonomy_SC_DNA.qza")
+SVs$data$Taxon<-gsub(";","; ",SVs$data$Taxon )
+write.table(tax, file=paste0(ps_name,"_tax.txt"), quote=FALSE, col.names=FALSE, sep="\t")
+```
+
+```{bash}
+#import tax table
+qiime tools import \
+--type FeatureData[Taxonomy] \
+--input-format HeaderlessTSVTaxonomyFormat \
+--input-path /Users/kalen/Documents/YNP_Project/16S/SC_Overall/copy_norm/SC_DNA_tax.txt \
+--output-path taxonomy_SC_DNA.qza
+```
+
+```{bash}
+#Run copy number normalization script in Qiime2
+qiime gcn-norm copy-num-normalize \
+  --i-table table_SC_DNA.qza \
+  --i-taxonomy taxonomy_SC_DNA.qza \
+  --o-gcn-norm-table table-normalized.qza
+  
+conda deactivate
+```
+
+```{r}
+#bring the normalized ASV table back into phyloseq
+taxonomy<-read_qza("/Users/kalen/Documents/YNP_Project/16S/SC_Overall/copy_norm/table-normalized.qza")
+psSC_copy_norm <- phyloseq(otu_table(taxonomy$data, taxa_are_rows = TRUE), tax_table(tax_table(SC_DNA)), sample_data(sample_data(SC_DNA)), phy_tree(bac.tre.rooted))
+sample_data(psSC_copy_norm)<-sample_data(SC_DNA) 
+ps_norm <- prune_samples(sample_sums(psSC_copy_norm) >= 1, psSC_copy_norm) #removing all samples with less than 1 read which helps with downstream stuff.
+ps_norm
+```
+
+Merging the copy number normalized and RNA phyloseq objects
+```{r}
+Overall.BA.GCN <- merge_phyloseq(ps_norm, SC_RNA)
+Overall.BA.GCN
+```
+
+
+
+
+---Bootstrap rarefaction
+Load necessary packages
+```{r}
+#install_github("mahendra-mariadassou/phyloseq-extended/R/graphical_methods.R") source of scripts
+source("/Users/kalen/Documents/YNP_Project/16S/YNP_16S_Overall/Phyloseq-extended.R") #this is a github repo with some nice functions that compliment phyloseq. I am going to use it for making rarefaction curves.
+library(vegan) #these are all of the dependencies for the scripts to work, I am loading them all here just in case they aren't already loaded.
+library(ggplot2)
+library(scales)
+library(reshape2)
+theme_bw()
+```
+
+To list the number of reads per sample and round the read counts to whole numbers since many functions only allow integers as inputs. 
+```{r}
+otu_table(Overall.BA.GCN)<-round(otu_table(Overall.BA.GCN),digits = 0)
+View(sort(sample_sums(Overall.BA.GCN), decreasing = FALSE)) 
+```
+
+rarefaction curve of the overall samples
+```{r}
+p <- ggrare(Overall.BA.GCN, step = 10, color = "Sample_Type", label = NULL, se = TRUE, plot = TRUE, parallel = FALSE)
+p <- p + facet_wrap(~Transect) + scale_x_continuous(limits=c(0, 10000), breaks = seq(0,10000,1000)) + theme(axis.text.x = element_text(size = 10, color = "black", angle = 45, hjust = 0.9)) #just to make it look a little prettier. 
+#p <- p + facet_wrap(~Sampling_date)
+p
+```
+
+Based on these results I am going to rarefy to a depth of 1080
+```{r}
+Overall.BA.GCN.R = rarefy_even_depth(Overall.BA.GCN, sample.size = 1080, rngseed = 712)
+sample_sums(Overall.BA.GCN.R)
+#This results in the removal of YNP022, 074, 151, 152, 153, 153_R, 316, 320_R. 1032 ASVs were removed. Unfortunately 151-153 is an entire sampling location. 
+```
+
+Saving phyloseq object as .RDS in order to perfrom bootstarp rarefication code
+```{r}
+saveRDS(Overall.BA.GCN, "/Users/kalen/Documents/YNP_Project/16S/SC_Overall/Overall_BA_GCN.RDS") #have to add this path to boot.r script for it to work on this file.
+```
+Perform 63 bootstrap rarefaction using the boot.r r script. more than 8 exceeded memory limits. For some reason YNP508 is being dropped during rarefaction despite have enough reads. 
+
+Import bootstrap rarefied phyloseq object and re-adding the phylogenetic tree
+```{r, message = FALSE}
+Overall.BA.GCN.R <- readRDS("/Users/kalen/Documents/YNP_Project/16S/SC_Overall/SC_multirare.RDS") #reading in new phyloseq object
+Overall.BA.GCN.R <- merge_phyloseq(Overall.BA.GCN.R, phy_tree(phy_tree(Overall.BA.GCN))) #this results in a message, but according to the phyloseq website this is ok and can be ignored.  I've added message =FALSE in the header  to mask this message from appearing bc it's a little annoying. 
+#otu_table(Overall.BA.GCN.R) <- t(otu_table(Overall.BA.GCN.R)) #can add this to transpose the ASV table so that taxa are rows and samples are columns. When the phyloseq object was built in boot.r, otu_table(df, taxa_are_rows = FALSE) was specified so it is correct. 
+```
+
+Check the number of samples being dropped due to limited reads. 
+```{r}
+Overall.BA.GCN #should only drop 8 samples through rarefaction between these two objects. 
+Overall.BA.GCN.R
+```
+
+
+---Subsetting and Normalization
+***SubSetting***
+For this dataset and in a general sense, I will be normalizing for construction of heatmaps and barcharts or rarefying for construction of ordination plots (alpha and beta diversities). Normalizing in this context is determining percent relative abundance. 
+Subsets of percent relative abundance datasets
+```{r}
+#Overall.BA.GCN.R = This is the gene count normalized and rarefied phyloseq object that will be used for diversity metrics analysis
+#Overall.BA.GCN = this is the gene count normalized phyloseq object that will be used for relative abundance analysis. 
+
+#This section is  all the subsets for percent relative abundance analysis and are normalized first.  
+Overall.BA.N <- transform_sample_counts(Overall.BA.GCN, function(x) x/sum(x) * 100) #normalizing the dataset to percent relative abundance for each asv in each sample. 
+Overall.BA.N <- filter_taxa(Overall.BA.N, function(x) mean(x) > 1e-6, TRUE) #this step filters out any taxa with less then an 1e-5 abundance
+
+
+Overall.Water.BA.N <- subset_samples(Overall.BA.N, Sample_Type == 'Filter')
+Water.SMU.BA.N <- subset_samples(Overall.Water.BA.N, Transect == 'SMU')
+Water.KB.BA.N <- subset_samples(Overall.Water.BA.N, Transect %in% c('KLR', 'BWS'))
+Water.KLR.BA.N <- subset_samples(Overall.Water.BA.N, Transect == 'KLR')
+Water.BWS.BA.N <- subset_samples(Overall.Water.BA.N, Transect == 'BWS')
+Water.Source.BA.N <-subset_samples(Overall.Water.BA.N, Transect == 'Source')
+
+Overall.Biofilm.BA.N <- subset_samples(Overall.BA.N, Sample_Type != 'Filter') #so that only Steep Cone biofilm is examined
+Random.BA.N <- subset_samples(Overall.Biofilm.BA.N, Sample_ID %in% c('YNP251','YNP252','YNP500','YNP501','YNP502'))
+Overall.Biofilm.BA.N <- subset_samples(Overall.Biofilm.BA.N, !Sample_ID %in% c('YNP251','YNP252','YNP500','YNP501','YNP502'))
+Lith.BA.N <- subset_samples(Overall.Biofilm.BA.N, Sample_Type == 'Lithified')
+Overall.Biofilm.BA.N <- subset_samples(Overall.Biofilm.BA.N, Sample_Type != 'Lithified')
+Biofilm.SMU.BA.N <- subset_samples(Overall.Biofilm.BA.N, Transect == 'SMU')
+Biofilm.SMU.Source.BA.N <- subset_samples(Overall.Biofilm.BA.N, (Transect %in% c("SMU", "Source"))&(Amplicon != 'rRNA')&(!Sample_ID %in% c('YNP015', 'YNP016', 'YNP017'))) #For comparison from source all the way to fringe of SMU without RNA or horizontal samples
+
+Biofilm.KB.BA.N <- subset_samples(Overall.Biofilm.BA.N, Transect %in% c('KLR', 'BWS')) #both KLR and BWS transects together since same outflow. 
+Biofilm.KLR.BA.N <- subset_samples(Overall.Biofilm.BA.N, Transect == 'KLR')
+Biofilm.BWS.All.BA.N <- subset_samples(Overall.Biofilm.BA.N, Transect == 'BWS')
+Biofilm.Source.BA.N <- subset_samples(Overall.Biofilm.BA.N, Transect == 'Source')
+
+SMU.Horiz.BA.N <- subset_samples(Biofilm.SMU.BA.N, Sample_ID %in% c('YNP015', 'YNP016', 'YNP017')) #only 3 horizontal ones
+SMU.Mat.All.BA.N <- subset_samples(Biofilm.SMU.BA.N, !Sample_ID %in% c('YNP015', 'YNP016', 'YNP017')) #all samples except 3 horizontal ones
+SMU.Mat.BA.N <- subset_samples(SMU.Mat.All.BA.N, Amplicon  != 'rRNA') #only DNA
+SMU.RNA.BA.N <- subset_samples(Biofilm.SMU.BA.N, Amplicon  == 'rRNA') #only RNA
+SMU.DNARNA.BA.N <- subset_samples(SMU.Mat.All.BA.N, Sampling_date %in% c('2018-9-29', '2019-8-11', '2020-8-21')) #only DNA with cDNA (or RNA however you look at it) paired samples
+
+Horizontal.BA.N <- subset_samples(Overall.Biofilm.BA.N, Distance_from_spring_ft %in% c('9.83','12.5'))
+LiveToLith.BA.N <- subset_samples(Overall.Biofilm.BA.N, Sample_Type == 'Live to Lith')
+
+Biofilm.BWS.BA.N <- subset_samples(Biofilm.BWS.All.BA.N, Sample_Type != 'Streamer')
+```
+
+Subsetting the rarefied data sets
+```{r}
+Overall.BA.GCN.R.int <- Overall.BA.GCN.R #doing this bc I may need the non rounded values later and I don't want to have to redo the import. 
+otu_table(Overall.BA.GCN.R.int)<-round(otu_table(Overall.BA.GCN.R.int),digits = 0) # due to bootstrap rarefaction, the abundances are now numerics, but many of the functions for plotting only accept integers. This function rounds each individual asv in each sample to a whole number. 
+
+#This section is all the subsets using the rarefied data for diversity metrics:
+Overall.Water.BA.R <- subset_samples(Overall.BA.GCN.R.int, Sample_Type == 'Filter')
+Water.SMU.BA.R <- subset_samples(Overall.Water.BA.R, Transect == 'SMU')
+Water.KB.BA.R <- subset_samples(Overall.Water.BA.R, Transect %in% c('KLR', 'BWS'))
+Water.KLR.BA.R <- subset_samples(Overall.Water.BA.R, Transect == 'KLR')
+Water.BWS.BA.R <- subset_samples(Overall.Water.BA.R, Transect == 'BWS')
+Water.Source.BA.R <-subset_samples(Overall.Water.BA.R, Transect == 'Source')
+
+Overall.Biofilm.BA.R <- subset_samples(Overall.BA.GCN.R.int, Sample_Type != 'Filter') #so that only Steep Cone biofilm is examined
+Random.BA.R <- subset_samples(Overall.Biofilm.BA.R, Sample_ID %in% c('YNP251','YNP252','YNP500','YNP501','YNP502'))
+Overall.Biofilm.BA.R <- subset_samples(Overall.Biofilm.BA.R, !Sample_ID %in% c('YNP251','YNP252','YNP500','YNP501','YNP502'))
+Lith.BA.R <- subset_samples(Overall.Biofilm.BA.R, Sample_Type == 'Lithified')
+Overall.Biofilm.BA.R <- subset_samples(Overall.Biofilm.BA.R, Sample_Type != 'Lithified')
+Biofilm.SMU.BA.R <- subset_samples(Overall.Biofilm.BA.R, Transect == 'SMU')
+Biofilm.SMU.Source.BA.R <- subset_samples(Overall.Biofilm.BA.R, Transect %in% c("SMU", "Source")) #For comparison from source all the way to fringe of SMU
+Biofilm.KB.BA.R <- subset_samples(Overall.Biofilm.BA.R, Transect %in% c('KLR', 'BWS')) #both KLR and BWS transects together since same outflow. 
+Biofilm.KLR.BA.R <- subset_samples(Overall.Biofilm.BA.R, Transect == 'KLR')
+Biofilm.BWS.All.BA.R <- subset_samples(Overall.Biofilm.BA.R, Transect == 'BWS')
+Biofilm.Source.BA.R <- subset_samples(Overall.Biofilm.BA.R, Transect == 'Source')
+
+SMU.Horiz.BA.R <- subset_samples(Biofilm.SMU.BA.R, Sample_ID %in% c('YNP015', 'YNP016', 'YNP017')) #only 3 horizontal ones
+SMU.Mat.All.BA.R <- subset_samples(Biofilm.SMU.BA.R, !Sample_ID %in% c('YNP015', 'YNP016', 'YNP017')) #all samples except 3 horizontal ones
+SMU.Mat.BA.R <- subset_samples(SMU.Mat.All.BA.R, Amplicon  != 'rRNA') #only DNA
+SMU.RNA.BA.R <- subset_samples(Biofilm.SMU.BA.R, Amplicon  == 'rRNA') #only RNA
+SMU.DNARNA.BA.R <- subset_samples(SMU.Mat.All.BA.R, Sampling_date %in% c('2018-9-29', '2019-8-11', '2020-8-21')) #only DNA with cDNA (or RNA however you look at it) paired samples
+
+Horizontal.BA.R <- subset_samples(Overall.Biofilm.BA.R, Distance_from_spring_ft %in% c('9.83','12.5'))
+LiveToLith.BA.R <- subset_samples(Overall.Biofilm.BA.R, Sample_Type == 'Live to Lith')
+
+Biofilm.BWS.BA.R <- subset_samples(Biofilm.BWS.All.BA.R, Sample_Type != 'Streamer')
+```
+
+
+---Alpha Diversity - With rarefied data - for pub used raw/singleton removed data.
+```{r}
+library(microbiomeSeq)
+library(vegan)
+library(ggplot2)
+library(cowplot)
+```
+
+### For publication - Evenness and Richness Plots ###
+Will Use Raw/singleton removed data = Overall.BA dataset
+```{r}
+library(breakaway) #richness
+#library(DivNet) #Shannon, Simpson, and other alpha diversities as well as some beta diversity indices
+library(microbiome) #evenness
+library(tidyverse)
+library(phyloseq)
+library(magrittr)
+```
+Using Overall.BA data set. remove RNA.
+https://bioconductor.riken.jp/packages/3.8/bioc/vignettes/microbiome/inst/doc/vignette.html
+https://microbiome.github.io/tutorials/Alphadiversity.html
+
+Filtering down data to just the SMU Biofilm samples
+```{r}
+SMU.Biofilm.raw <- Overall.BA %>%
+  subset_samples((!Sample_Type %in% c('Filter', 'Lithified', 'Biomass'))&(Transect %in% c("SMU", "Source"))&(Amplicon != 'rRNA')&(!Sample_ID %in% c('YNP015', 'YNP016', 'YNP017'))&(Distance_from_spring_ft %in% c("0", "3", "6", "9", "12", "15")))
+
+#bringing in data.frame with days information.
+time_diff <- read.csv('/Users/kalen/Documents/YNP_Project/16S/SC_Overall/Time_diff.csv', sep = ",") %>%
+  mutate(Sampling_date = as.character(Sampling_date))
+
+#adding in some additional metadata and have to rebuild phyloseq option, because otherwise down stream issues will arise. 
+dat <- SMU.Biofilm.raw %>%
+  sample_data() %>% 
+  merge(time_diff,
+            by = c("Sampling_date", "Distance_from_spring_ft"))
+rownames(dat) <- dat$Sample_ID
+
+#remaking the phyloseq object
+SMU.Biofilm.raw <- phyloseq(otu_table(SMU.Biofilm.raw),
+                            tax_table(SMU.Biofilm.raw),
+                            phy_tree(SMU.Biofilm.raw),
+                          sample_data(dat))
+
+sample_data(SMU.Biofilm.raw) %>%
+  write.csv("/Users/kalen/Documents/YNP_Project/16S/SC_Overall/sc_melt.csv", row.names = FALSE)
+```
+
+Removing singletons for evenness calc. 
+```{r}
+View(data.frame(colSums(otu_table(SMU.Biofilm.raw)))) #this shows that there are a number of ASVs that after filtering are occuring 1 or 0 times in the data set. I am going to remove these ASVs from the ps object prior to alpha diversity metrics. 
+SMU.Biofilm.raw
+SMU.Biofilm.f <- prune_taxa(taxa_sums(SMU.Biofilm.raw) > 1, SMU.Biofilm.raw) #removing 0s and singletons
+SMU.Biofilm.f
+View(data.frame(colSums(otu_table(SMU.Biofilm.f))))
+```
+
+Calculating evenness, averages for triplicate samples, and standard deviation
+```{r}
+sample_data(SMU.Biofilm.f)$evenness <- microbiome::alpha(SMU.Biofilm.f, index = "evenness_pielou")[,1]
+
+even <- sample_data(SMU.Biofilm.f) %>%
+  group_by(Sampling_date, Distance_from_spring_ft) %>%
+  summarise(mean = mean(evenness), sd = sd(evenness)) %>%
+  ungroup()
+even$Distance_from_spring_ft <- as.character(even$Distance_from_spring_ft) #have to convert to character otherwise it will interpret it as a continuous axis for boxplots
+even <- even %>%
+  mutate(Distance_from_spring_ft = factor(Distance_from_spring_ft, levels = c('0','3','6','9','12','15'))) 
+```
+
+Evenness plot
+```{r}
+evenp <- even %>%
+  mutate(Sampling_date = factor(Sampling_date, levels = c("2020-8-21", "2019-8-11", "2018-9-29", "2018-7-26", "2018-5-30", "2017-8-18", "2010-6-4"))) %>%
+  ggplot(aes(x = Distance_from_spring_ft, y = mean, group=interaction(Sampling_date, Distance_from_spring_ft))) +
+  geom_boxplot(aes(group = Distance_from_spring_ft), outlier.shape = NA, color = 'black') +
+  geom_errorbar(aes(ymin = mean-sd, ymax = mean+sd), width = 0, position=position_dodge(-0.5), color = '#666666', size = 0.75) + #may be able to move the group call above in aes down here. 
+  geom_dotplot(binaxis = 'y', stackdir = 'center', position=position_dodge(-0.5), dotsize= 1, aes(fill=Sampling_date)) +
+  theme_bw() +
+  labs(x="Distance From Spring (m)", y="Pielou's Evenness", fill="Sampling Date") +
+  coord_cartesian(ylim = c(0.2,0.9)) + scale_y_continuous(breaks = seq(0.2,0.9,0.2)) +
+  theme(axis.text = element_text(size = 10, color = "black"), axis.title = element_text(size = 12, color = "black"), 
+        legend.title = element_text(size = 12, color = "black"), legend.text = element_text(size = 10, color = 'black'),
+        axis.ticks = element_line(colour = "black"), 
+        panel.border = element_rect(colour="black")) +
+  guides(fill = guide_legend(reverse = TRUE)) +
+  viridis::scale_fill_viridis(discrete = TRUE, option="plasma") +
+  scale_x_discrete(labels=c("0" = "0", "3" = "1",
+                              "6" = "2", "9" = "3", "12" = "4", "15" = "5"))
+
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/AlphaBeta/evenneess_bp.pdf", width = 12, height = 7)
+```
+
+Evenness statistics
+```{r}
+evenstat <- sample_data(SMU.Biofilm.f) %>% 
+  as_tibble() %>%
+  mutate(Sampling_date = factor(Sampling_date, levels = c("2010-6-4", "2017-8-18", "2018-5-30", "2018-7-26", "2018-9-29", "2019-8-11", "2020-8-21")),
+         Distance_from_spring_ft = factor(Distance_from_spring_ft, levels = c('0','3','6','9','12','15')))
+
+#Visualize the distribution of data
+hist(evenstat$evenness, main = "evenness", xlab = "", breaks = 10)
+#Shapiro-Wilk test of normality
+shapiro.test(evenstat$evenness) #the p-value is below 0.05, therefore the hypothesis that the data are not normally distributed is statistically supported. A p-value above 0.05 would support the null hypothesis that the data are normal. 
+levels(evenstat$Distance_from_spring_ft)
+levels(evenstat$Sampling_date)
+
+#Kruskal Wallis tests. Allows for testing across multiple categorical entries. In this case 6 for Distance and 7 for date. 
+kruskal.test(evenness ~ Sampling_date, data=evenstat) #is significant
+kruskal.test(evenness ~ Distance_from_spring_ft, data=evenstat) #is significant
+```
+
+Paired statistical tests at individual locations or times. 
+```{r}
+#testing across time
+evenstat %>% filter(Sampling_date != '2017-8-18') %>%
+  group_by(Distance_from_spring_ft) %>%
+  rstatix::pairwise_wilcox_test(evenness ~ Sampling_date, p.adjust.method = "fdr") %>%
+  #filter(p < 0.05) %>% 
+  rstatix::add_significance("p")
+
+#testing across distance
+evenstat %>% filter(Sampling_date != '2017-8-18') %>%
+  group_by(Sampling_date) %>%
+  rstatix::pairwise_wilcox_test(evenness ~ Distance_from_spring_ft, p.adjust.method = "fdr") %>%
+  #filter(p < 0.05) %>% 
+  rstatix::add_significance("p")
+```
+Nothing was statistically significant. 
+
+Paired statistical tests across all times or locations
+Removing 2017, because only 2 samples and both are only at the source.
+```{r}
+#testing for statistical sig for time across all locations
+x <- evenstat %>% 
+  #group_by() %>%
+  rstatix::pairwise_wilcox_test(evenness ~ Sampling_date, p.adjust.method = "fdr") %>%
+  filter(p < 0.05) %>% 
+  rstatix::add_significance("p") %>%
+  filter(p.adj.signif != "ns")
+
+y <- evenstat %>% rstatix::wilcox_effsize(evenness ~ Sampling_date)
+
+tmp1 <- merge(x,y, by=c(".y.", "group1","group2",  "n1", "n2"))
+
+#testing for statistical sig for distance across all sampling points
+x <- evenstat %>% 
+  #group_by() %>%
+  rstatix::pairwise_wilcox_test(evenness ~ Distance_from_spring_ft, p.adjust.method = "fdr") %>%
+  filter(p < 0.05) %>% 
+  rstatix::add_significance("p") %>%
+  filter(p.adj.signif != "ns")
+
+y <- evenstat %>% rstatix::wilcox_effsize(evenness ~ Distance_from_spring_ft)
+
+tmp2 <- merge(x,y, by=c(".y.", "group1","group2",  "n1", "n2"))
+
+evensig <- rbind(tmp1, tmp2)
+```
+Significant correlations were combined below with richness stats and saved. 
+
+Richness analysis using Breakaway 
+```{r}
+SMU.Biofilm.b <- prune_taxa(taxa_sums(SMU.Biofilm.raw) > 0, SMU.Biofilm.raw) #removing 0s
+View(data.frame(colSums(otu_table(SMU.Biofilm.b))))
+
+set.seed(1)
+SMU.brich <- SMU.Biofilm.b %>%
+  breakaway() #estimates the richness. 
+
+summary(SMU.brich) %>% as_tibble #summary of the output
+plot(SMU.brich, physeq=SMU.Biofilm.b, color="Sampling_date")
+
+#Exporting results dataframe for SI
+SMU.brich %>% summary %>%
+  as_tibble() %>%
+  write.csv(file = "/Users/kalen/Documents/Dissertation/Chapter_1/Figures/AlphaBeta/breakaway_sum.csv")
+
+
+#Combining metadata with richness estimates. 
+meta <- SMU.Biofilm.b %>%
+  sample_data %>%
+  as_tibble %>%
+  mutate("sample_names" = SMU.Biofilm.b %>% sample_names)
+estrich <- meta %>%
+  left_join(summary(SMU.brich),
+            by = c("Sample_ID" = "sample_names"))
+```
+
+Calculating averages for triplicate samples, and standard deviation of estimated richness. 
+```{r}
+rich <- estrich %>%
+  group_by(Sampling_date, Distance_from_spring_ft) %>%
+  summarise(mean = mean(estimate), sd = sd(estimate)) %>%
+  ungroup() %>%
+  mutate_at(vars("Distance_from_spring_ft"), as.character) %>%
+  mutate(Distance_from_spring_ft = factor(Distance_from_spring_ft, levels = c('0','3','6','9','12','15'))) 
+```
+
+Plotting estimated richness 
+```{r}
+richp <- rich %>%
+ mutate(Sampling_date = factor(Sampling_date, levels = c("2020-8-21", "2019-8-11", "2018-9-29", "2018-7-26", "2018-5-30", "2017-8-18", "2010-6-4"))) %>%
+  ggplot(aes(x = Distance_from_spring_ft, y = mean, group=interaction(Sampling_date, Distance_from_spring_ft))) +
+  geom_boxplot(aes(group = Distance_from_spring_ft), outlier.shape = NA, color = 'black') +
+  geom_errorbar(aes(ymin = mean-sd, ymax = mean+sd), width = 0, position=position_dodge(-0.5), color = '#666666', size = 0.75) + #may be able to move the group call above in aes down here. 
+  geom_dotplot(binaxis = 'y', stackdir = 'center', position=position_dodge(-0.5), dotsize= 1, aes(fill=Sampling_date)) +
+  theme_bw() +
+  labs(x="Distance From Spring (m)", y="Estimated Richness", fill="Sampling Date") +
+  coord_cartesian(ylim = c(20,180)) + scale_y_continuous(breaks = seq(20,180,40), expand = c(0, 12)) + 
+  theme(axis.text = element_text(size = 10, color = "black"), axis.title = element_text(size = 12, color = "black"), 
+        legend.title = element_text(size = 12, color = "black"), legend.text = element_text(size = 10, color = 'black'),
+        axis.ticks = element_line(colour = "black"), panel.border = element_rect(colour="black")) +
+  guides(fill = guide_legend(reverse = TRUE, override.aes = list(size = 8.5))) +
+  viridis::scale_fill_viridis(discrete = TRUE, option="plasma") +
+  scale_x_discrete(labels=c("0" = "0", "3" = "1",
+                              "6" = "2", "9" = "3", "12" = "4", "15" = "5"))
+
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/AlphaBeta/richness_bp.pdf", width = 12, height = 7)
+```
+
+Combining evenness and richness plots
+```{r}
+grid <- egg::ggarrange(evenp + theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title.x = element_blank(), plot.margin = margin(b = 0.75, t = 1.2), axis.title.y = element_text(size = 12, margin = margin(r=6)), legend.position = "none"),
+  richp + theme(plot.margin = margin(t = 0.75, b = 1, l = 1.2), axis.title = element_text(size = 12), axis.title.y = element_text(margin = margin(r=5.5))),
+                   ncol = 1)
+ggsave(plot = grid, "/Users/kalen/Documents/Dissertation/Chapter_1/Figures/AlphaBeta/comb_bp.pdf", width = 11, height = 7)
+```
+
+Richness stats
+Could not get betta() to work properly with my data despite a ton of different tries and following multiple issue treads on their website. Moving on and will be using the Kruskal-wallis and wilcoxon tests. Time and Distance are both categorical variables since they were samples at specific times and locations not along a continuous gradient. 
+```{r}
+estrich <- estrich %>% 
+  mutate(Sampling_date = factor(Sampling_date, levels = c("2010-6-4", "2017-8-18", "2018-5-30", "2018-7-26", "2018-9-29", "2019-8-11", "2020-8-21")),
+         Distance_from_spring_ft = factor(Distance_from_spring_ft, levels = c('0','3','6','9','12','15')))
+
+#Visualize the distribution of data
+hist(estrich$estimate, main = "Estimated Richness", xlab = "", breaks = 10)
+#Shapiro-Wilk test of normality
+shapiro.test(estrich$estimate) #the p-value is below 0.05, therefore the hypothesis that the data are not normally distributed is statistically supported. A p-value above 0.05 would support the null hypothesis that the data are normal. 
+levels(estrich$Distance_from_spring_ft)
+levels(estrich$Sampling_date)
+
+#Kruskal Wallis tests. Allows for testing across multiple categorical entries. In this case 6 for Distance and 7 for date. 
+kruskal.test(estimate ~ Sampling_date, data=estrich) #is significant
+kruskal.test(estimate ~ Distance_from_spring_ft, data=estrich) #is significant
+```
+
+
+Wilcoxon Rank sum test to test significance between two categorical entries.
+
+Paired statistical tests across all times or locations
+Removing 2017, because only 2 samples and both are only at the source.
+```{r}
+#testing for statistical sig for time across all locations
+x <- estrich %>%
+  #group_by() %>%
+  rstatix::pairwise_wilcox_test(estimate ~ Sampling_date, p.adjust.method = "fdr") %>%
+  filter(p < 0.05) %>% 
+  rstatix::add_significance("p") %>%
+  filter(p.adj.signif != "ns")
+
+y <- estrich %>% rstatix::wilcox_effsize(estimate ~ Sampling_date)
+
+tmp1 <- merge(x,y, by=c(".y.", "group1","group2", "n1", "n2"))
+
+#testing for statistical sig for distance across all sampling points
+x <- estrich %>%
+  #group_by() %>%
+  rstatix::pairwise_wilcox_test(estimate ~ Distance_from_spring_ft, p.adjust.method = "fdr") %>%
+  filter(p < 0.05) %>% 
+  rstatix::add_significance("p") %>%
+  filter(p.adj.signif != "ns")
+
+y <- estrich %>% rstatix::wilcox_effsize(estimate ~ Distance_from_spring_ft)
+
+tmp2 <- merge(x,y, by=c("group1","group2", ".y.", "n1", "n2"))
+
+richsig <- rbind(tmp1, tmp2) %>%
+  mutate(.y. = str_replace(.y., "estimate", "richness"))
+```
+
+Paired statistical tests at individual locations or times. 
+```{r}
+#testing for statistical sig for time across all locations
+estrich %>% filter(Sampling_date != '2017-8-18') %>%
+  group_by(Distance_from_spring_ft) %>%
+  rstatix::pairwise_wilcox_test(estimate ~ Sampling_date, p.adjust.method = "fdr") %>%
+  filter(p < 0.05) %>% 
+  rstatix::add_significance("p")
+
+#testing for statistical sig for distance across all sampling points
+estrich %>% filter(Sampling_date != '2017-8-18') %>%
+  group_by(Sampling_date) %>%
+  rstatix::pairwise_wilcox_test(estimate ~ Distance_from_spring_ft, p.adjust.method = "fdr") %>%
+  filter(p < 0.05) %>% 
+  rstatix::add_significance("p")
+```
+Nothing is statistically significant.
+
+Combining all statistically significant results into one dataframe for exporting
+```{r}
+x <- rbind(evensig, richsig) %>%
+  as_tibble() %>% 
+  rename(metric = .y.)
+
+write.csv(x, file = "/Users/kalen/Documents/YNP_Project/16S/SC_Overall/Alpha_Wilcox_Sig.csv")
+```
+
+
+
+---Beta Diversity
+### For publication - Beta Diversity Plots ###
+Will use Gene count normalized and rarefied data. Overall.BA.GCN.R.int = which is GCN and bootstrap rarefied and the asv's have been converted to integers. 
+```{r}
+library(phyloseq)
+library(tidyverse)
+library(cowplot)
+library(vegan)
+```
+
+Prepping data
+Filter 2017 samples for stats since only 2 samples both at source, keep 2017 samples in for plots. 
+```{r}
+SMU.Biofilm.beta <- Overall.BA.GCN.R.int %>%
+  subset_samples((!Sample_Type %in% c('Filter', 'Lithified', 'Biomass'))&(Transect %in% c("SMU", "Source"))&(Amplicon != 'rRNA')&(!Sample_ID %in% c('YNP015', 'YNP016', 'YNP017'))&(Distance_from_spring_ft %in% c("0", "3", "6", "9", "12", "15"))) #%>%
+  #subset_samples(!Sampling_date == '2017-8-18') #%>% #keep this filter for stats, but comment out for plots
+  #subset_samples(!Sampling_date == '2010-6-4')
+
+#Converting date and distance to factors with distinct orders. 
+sample_data(SMU.Biofilm.beta)$Distance_from_spring_ft <- factor(sample_data(SMU.Biofilm.beta)$Distance_from_spring_ft)
+sample_data(SMU.Biofilm.beta)$Sampling_date <- factor(sample_data(SMU.Biofilm.beta)$Sampling_date)
+
+#Rerooting in case outgroup was lost during subsetting. May use wunifrac so the phylogenetic tree matters. 
+new.outgroup = pick_new_outgroup(SMU.Biofilm.beta@phy_tree)
+SMU.Biofilm.beta@phy_tree = ape::root(SMU.Biofilm.beta@phy_tree, outgroup=new.outgroup, resolve.root=TRUE)
+SMU.Biofilm.beta
+```
+There are 5 less samples for beta diversity compared to the alpha diversity, because they had low sequencing depth and were lost during rarefaction. 
+
+Will test Bray-Curtis distance matrices. They all make sense for this study, but prioritize aspects of the microbiome a little differently. 
+```{r}
+bc <- ordinate(SMU.Biofilm.beta, method = "PCoA", distance = "bray")
+
+bcP <- plot_ordination(SMU.Biofilm.beta, bc, color = "Sampling_date", shape = "Distance_from_spring_ft") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), legend.key=element_blank()) + 
+  geom_point(size = 2.25, aes()) +
+  viridis::scale_color_viridis(discrete = TRUE, option="plasma", direction = -1, name = "Sampling Date") +
+  scale_shape_manual(values = c(15,1,17,18,19,6), name = "Distance (ft)")
+print(bcP)
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/AlphaBeta/bcOrd.pdf", width = 12, height = 7)
+
+plot_scree(bc, title = "Contributions of Principal components") + scale_x_discrete(limits=c(1:15))
+bc$values$Relative_eig #21.9 and 20.2 = 42.1
+```
+
+ # Alternatives to ordination #
+Constructing Distance matrices
+```{r}
+asvs <- as.matrix(otu_table(SMU.Biofilm.beta)) %>%
+  data.frame()
+map <- SMU.Biofilm.beta %>%
+  sample_data() %>%
+  merge(time_diff,
+            by = c("Sampling_date", "Distance_from_spring_ft")) %>%
+  select(Sample_ID, Replicate_Number, Sampling_date, Distance_from_spring_ft, DaysSince_t0, DaysSince_prevdate, DaysSince_prevsampling) #%>%
+  #select(Sample_ID, Sampling_date, Distance_from_spring_ft, DaysSince_t0, Replicate_Number) #can remove if other info is still desired.
+rownames(map) <- map$Sample_ID
+
+bc_dist <- vegdist(asvs, method = "bray") #samples were already bootstrap rarefied so not using avgdist. 
+```
+
+ # For Comparing within distances group #
+ 
+!!! If 2017 samples are being lost check line 1450 to see if 2017 samples are being filtered to make the bc_dist. It should not be filtered out for figures since 2017 only had 2 samples both at the source, but should be removed for stats tests below. !!!!
+
+Bray_Curtis & Wunifrac Time Lag Plots - these plots show community stability through time. Beta diversity vs. difference in time between sampling. 
+```{r}
+bc_dist %>% #issue is that one can not have a BC-Dist less than 0. 
+  as.matrix() %>%
+  as_tibble(rownames = "sample_id") %>%
+  pivot_longer(-sample_id) %>%
+  filter(sample_id < name) %>%
+  left_join(map,
+            by = c("sample_id" = "Sample_ID")) %>%
+  left_join(map,
+            by = c("name" = "Sample_ID")) %>% 
+  mutate(tgap = abs(DaysSince_t0.x - DaysSince_t0.y)) %>%
+  filter(Distance_from_spring_ft.x == Distance_from_spring_ft.y & tgap > 0) %>%
+  #filter(Replicate_Number.x == Replicate_Number.y) %>% #can remove this easily if desired. 
+  group_by(tgap, Distance_from_spring_ft.x, Replicate_Number.x) %>% #maybe add Sampling_date.x
+  #summarize(median = median(value)) %>%
+  ungroup %>%
+  ggplot(aes(x = tgap, y = value, color = Distance_from_spring_ft.x, group=paste0(Distance_from_spring_ft.x, Replicate_Number.x))) +
+  geom_jitter(size = 0.75, position = position_jitter(5)) +
+  geom_smooth(aes(group=Distance_from_spring_ft.x), se=F, size=2) +
+  labs(x="Days Between Time Points",
+       y="Bray-Curtis Distance") + 
+  theme_classic() +
+  #scale_x_continuous(breaks = seq(0,3800, 400), expand = expansion(mult = c(0.02, 0)), limits = c(0, 3800)) +
+  scale_y_continuous(breaks = seq(-0.25,1, 0.25)) +
+  viridis::scale_color_viridis(name = 'Distance', discrete = TRUE, option = 'viridis', direction = -1, begin = 0.25)
+
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/AlphaBeta/AltToOrd/timelag_bc.pdf", width = 10, height = 7)
+```
+
+Bray_Curtis & Wunifrac distance since previous sampling time lag plots
+```{r}
+prev.vec <- as.integer(unique(map$DaysSince_prevsampling) - 1) #vector of values that corresponds to sequential time gaps.
+prev.vec[prev.vec < 0] <- 0
+prev.vec <- replace(prev.vec, prev.vec == 2917, 2918)
+
+bc_dist %>% #issue is that you can not have a BC distance greater than 1
+  as.matrix() %>%
+  as_tibble(rownames = "sample_id") %>%
+   pivot_longer(-sample_id) %>%
+  filter(sample_id < name) %>%
+  left_join(map,
+            by = c("sample_id" = "Sample_ID")) %>%
+  left_join(map,
+            by = c("name" = "Sample_ID")) %>% 
+  mutate(tgap = abs(DaysSince_t0.x - DaysSince_t0.y),
+         day = if_else(DaysSince_t0.y > DaysSince_t0.x, DaysSince_t0.y, DaysSince_t0.x)) %>%
+  filter(Distance_from_spring_ft.x == Distance_from_spring_ft.y & tgap %in% prev.vec & tgap > 0) %>%
+  #select(sample_id, name, Sampling_date.x, Sampling_date.y, tgap, DaysSince_t0.x, DaysSince_t0.y, day)  #for checking
+  ggplot(aes(x = day, y = value, color = Distance_from_spring_ft.x, group=paste0(Distance_from_spring_ft.x, Replicate_Number.x))) +
+  geom_jitter(size = 2, position = position_jitter(7), alpha = 0.65) +
+  #geom_line(size = 0.75) +
+  geom_smooth(aes(group=Distance_from_spring_ft.x), se=F, size=1.5) +
+  labs(x="Days After Initial Sampling Date",
+       y="Bray-Curtis Distance to Previous Sampling") + 
+  theme_classic() +
+  scale_x_continuous(limits = c(2900, 3810), breaks = seq(2900,3800, 150), expand = expansion(add = c(0, 0.03))) +
+  scale_y_continuous(limits = c(0.1, 1.048), breaks = seq(0, 1, 0.2), expand = expansion(add = c(0.0,0.03))) +
+  viridis::scale_color_viridis(name = 'Distance (m)', discrete = TRUE, option = 'viridis', direction = -1, begin = 0.25,
+                               labels=c("0", "1", "2", "3", "4", "5")) +
+  guides(color = guide_legend(override.aes = list(shape=NA, size = 2.5))) +
+  theme(axis.ticks = element_line(color = "black"),
+        axis.text = element_text(size=10, color = "black"),
+        axis.title = element_text(size = 14, color = "black"),
+        legend.position = c(1.01, 0.5), legend.background = element_rect(fill = NA),
+        plot.margin = margin(t = 0.55, r = 1.9, b = 0.2, l = 0.2, unit = "cm"))
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/AlphaBeta/AltToOrd/prevsam_bc.pdf", width = 11, height = 7)
+```
+
+Bray_Curtis & Wunifrac distance to initial sampling. 
+```{r}
+t0 <- c(285,342,407,723,1099) #time gaps corresponding to time to initial sampling for distance = 0 (2017)
+vec <-  unique(map$DaysSince_t0)
+t0.vec <- append(t0, vec) #all of the time gaps that are for comparisons between initial sampling and w/e sampling is being compared to is. 
+
+t0.vec <- c(57,122,438,814) #time gaps when comparing back to first 2018 sampling
+
+bc_dist %>% # issue is that you can't have a BC-dist greater than 1
+  as.matrix() %>%
+  as_tibble(rownames = "sample_id") %>%
+   pivot_longer(-sample_id) %>%
+  filter(sample_id < name) %>%
+  left_join(map,
+            by = c("sample_id" = "Sample_ID")) %>%
+  left_join(map,
+            by = c("name" = "Sample_ID")) %>%
+  mutate(tgap = abs(DaysSince_t0.x - DaysSince_t0.y),
+         day = if_else(DaysSince_t0.y > DaysSince_t0.x, DaysSince_t0.y, DaysSince_t0.x)) %>%
+  filter(Distance_from_spring_ft.x == Distance_from_spring_ft.y & tgap %in% t0.vec & tgap > 0) %>%
+  ggplot(aes(x = day, y = value, color = Distance_from_spring_ft.x, group=paste0(Distance_from_spring_ft.x, Replicate_Number.x))) +
+  geom_jitter(size = 2, position = position_jitter(7), alpha = 0.65) +
+  #geom_line(size = 0.75) +
+  geom_smooth(aes(group=Distance_from_spring_ft.x), se=F, size=1.5) +
+  labs(x="Days After Initial Sampling Date",
+       y="Bray-Curtis Distance to Initial Sampling") + 
+  theme_classic() +
+  #scale_x_continuous(limits = c(2900, 3800), breaks = seq(2900,3800, 100), expand = expansion(mult = c(0, 0))) +
+  scale_y_continuous(limits = c(0.1, 1.1), breaks = seq(0.1, 1, 0.1), expand = expansion(add = c(0,0))) +
+  viridis::scale_color_viridis(name = 'Distance', discrete = TRUE, option = 'viridis', direction = -1, begin = 0.25) +
+  guides(color = guide_legend(override.aes = list(shape=NA))) +
+  theme(axis.text = element_text(size=10, color = "black"),
+        axis.title = element_text(size = 14, color = "black"),
+        legend.position = c(0.99, 0.5), legend.background = element_rect(fill = NA),
+        plot.margin = margin(t = 0.55, r = 0.85, b = 0.2, l = 0.2, unit = "cm"))
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/AlphaBeta/AltToOrd/intsam_bc.pdf", width = 10, height = 7)
+```
+
+Bray_Curtis & Wunifrac distance Distance along transect lag plot - shows community variation along increasing distances comparisons. 
+```{r}
+bc_dist %>% 
+  as.matrix() %>%
+  as_tibble(rownames = "sample_id") %>%
+   pivot_longer(-sample_id) %>%
+  filter(sample_id < name) %>%
+  left_join(map,
+            by = c("sample_id" = "Sample_ID")) %>%
+  left_join(map,
+            by = c("name" = "Sample_ID")) %>% 
+  mutate(Distance_from_spring_ft.x = as.numeric(levels(Distance_from_spring_ft.x))[Distance_from_spring_ft.x],
+         Distance_from_spring_ft.y = as.numeric(levels(Distance_from_spring_ft.y))[Distance_from_spring_ft.y],
+    gap = abs(Distance_from_spring_ft.x - Distance_from_spring_ft.y)) %>%
+  filter(Sampling_date.x == Sampling_date.y) %>%
+  group_by(gap, Sampling_date.x, Replicate_Number.x) %>%
+  #summarize(mean = mean(value)) %>%
+  ungroup() %>%
+  ggplot(aes(x = gap, y = value, color = Sampling_date.x, group=paste0(Sampling_date.x, Replicate_Number.x))) +
+  geom_jitter(size = 2, position = position_jitter(0.3), alpha = 0.5) +
+  #geom_line(size = 0.75) +
+  geom_smooth(aes(group=Sampling_date.x), se=F, size=1.5) +
+  labs(x="Distance (m) Between Samples",
+       y="Bray-Curtis Distance") +
+  theme_classic() +
+  scale_x_continuous(limits = c(0, 15), breaks = seq(0,15, 3), expand = expansion(mult = c(0.01, 0.04)),
+                     labels=c("0" = "0", "3" = "1",
+                              "6" = "2", "9" = "3", "12" = "4", "15" = "5")) +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2), expand = expansion(add = c(0.0,0.03))) +
+  viridis::scale_color_viridis(name = "Date", discrete = TRUE, option="plasma", direction = 1, begin = 0.95, end = 0) +
+  guides(color = guide_legend(override.aes = list(shape=NA, size = 2.5))) +
+  theme(axis.ticks = element_line(color = "black"),
+        axis.text = element_text(size=10, color = "black"),
+        axis.title = element_text(size = 14, color = "black"),
+        legend.position = c(0.96, 0.5), legend.background = element_rect(fill = NA),
+        plot.margin = margin(t = 0.55, r = 1.05, b = 0.2, l = 0.2, unit = "cm"))
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/AlphaBeta/AltToOrd/distlag_bc.pdf", width = 10, height = 7)
+```
+
+Bray_Curtis & Wunifrac distance from previous sampling location
+```{r}
+#all the samples at 3ft in 2018-9-29 were lost during rarefaction, so will pull out comparisons from 6ft to 0ft for that time to add to data set. 
+y <- bc_dist %>% #issue, can't have a BC-dist greater than 1
+  as.matrix() %>%
+  as_tibble(rownames = "sample_id") %>%
+   pivot_longer(-sample_id) %>%
+  filter(sample_id < name) %>%
+  left_join(map,
+            by = c("sample_id" = "Sample_ID")) %>%
+  left_join(map,
+            by = c("name" = "Sample_ID")) %>% 
+  mutate(Distance_from_spring_ft.x = as.numeric(levels(Distance_from_spring_ft.x))[Distance_from_spring_ft.x],
+         Distance_from_spring_ft.y = as.numeric(levels(Distance_from_spring_ft.y))[Distance_from_spring_ft.y],
+    gap = abs(Distance_from_spring_ft.x - Distance_from_spring_ft.y),
+    dist = if_else(Distance_from_spring_ft.y > Distance_from_spring_ft.x, Distance_from_spring_ft.y, Distance_from_spring_ft.x)) %>%
+  filter(Sampling_date.x == Sampling_date.y & Sampling_date.x == "2018-9-29", 
+         Distance_from_spring_ft.y == 6, Distance_from_spring_ft.x == 0) #%>%
+  #select(sample_id, name, value, Sampling_date.x, Sampling_date.y, Distance_from_spring_ft.x, Distance_from_spring_ft.y)
+
+#adding in y to this data which compares 6ft to 0ft in 2018-9 bc lack of data, may drop.
+bc_dist %>% #issue, can't have a BC-dist greater than 1. 
+  as.matrix() %>%
+  as_tibble(rownames = "sample_id") %>%
+   pivot_longer(-sample_id) %>%
+  filter(sample_id < name) %>%
+  left_join(map,
+            by = c("sample_id" = "Sample_ID")) %>%
+  left_join(map,
+            by = c("name" = "Sample_ID")) %>% 
+  mutate(Distance_from_spring_ft.x = as.numeric(levels(Distance_from_spring_ft.x))[Distance_from_spring_ft.x],
+         Distance_from_spring_ft.y = as.numeric(levels(Distance_from_spring_ft.y))[Distance_from_spring_ft.y],
+    gap = abs(Distance_from_spring_ft.x - Distance_from_spring_ft.y),
+    dist = if_else(Distance_from_spring_ft.y > Distance_from_spring_ft.x, Distance_from_spring_ft.y, Distance_from_spring_ft.x)) %>%
+  filter(Sampling_date.x == Sampling_date.y, gap == 3) %>%
+  #filter(Distance_from_spring_ft.y < Distance_from_spring_ft.x) #%>% #this is just to check that y is always larger than x
+  rbind(y) %>%
+  ggplot(aes(x = dist, y = value, color = Sampling_date.x, group=paste0(Sampling_date.x, Replicate_Number.x))) +
+  geom_jitter(size = 2, position = position_jitter(0.3), alpha = 0.5) +
+  #geom_line(size = 0.75) +
+  geom_smooth(aes(group=Sampling_date.x), se=F, size=1.5) +
+  labs(x="Distance (m) from Source",
+       y="Bray-Curtis Distance to \nPrevious Sampling Location") +
+  theme_classic() +
+  scale_x_continuous(limits = c(3, 15), breaks = seq(3,15, 3), expand = expansion(mult = c(0.01, 0.04)),
+                     labels=c("3" = "1", "6" = "2", "9" = "3", "12" = "4", "15" = "5")) +
+  scale_y_continuous(limits = c(0, 1.08), breaks = seq(0, 1, 0.2), expand = expansion(add = c(0.0,0))) +
+  viridis::scale_color_viridis(name = "Date", discrete = TRUE, option="plasma", direction = 1, begin = 0.95, end = 0) +
+  guides(color = guide_legend(override.aes = list(shape=NA))) +
+  theme(axis.text = element_text(size=10, color = "black"),
+        axis.title = element_text(size = 14, color = "black"),
+        plot.margin = margin(t = 0.55, r = 0.1, b = 0.2, l = 0.2, unit = "cm")) 
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/AlphaBeta/AltToOrd/prevdis_bc.pdf", width = 10, height = 7)
+```
+
+Bray_Curtis & Wunifrac distance from source location
+```{r}
+#the 2010 sampling does not have any samples at distance = 0, so need to pull data comparing to distance = 3.
+y <- bc_dist %>% #issue, can't have a BC-dist greater than 1
+  as.matrix() %>%
+  as_tibble(rownames = "sample_id") %>%
+   pivot_longer(-sample_id) %>%
+  filter(sample_id < name) %>%
+  left_join(map,
+            by = c("sample_id" = "Sample_ID")) %>%
+  left_join(map,
+            by = c("name" = "Sample_ID")) %>% 
+  mutate(Distance_from_spring_ft.x = as.numeric(levels(Distance_from_spring_ft.x))[Distance_from_spring_ft.x],
+         Distance_from_spring_ft.y = as.numeric(levels(Distance_from_spring_ft.y))[Distance_from_spring_ft.y],
+    gap = abs(Distance_from_spring_ft.x - Distance_from_spring_ft.y),
+    dist = if_else(Distance_from_spring_ft.y > Distance_from_spring_ft.x, Distance_from_spring_ft.y, Distance_from_spring_ft.x)) %>%
+  filter(Sampling_date.x == Sampling_date.y & Sampling_date.x == "2010-6-4", 
+         Distance_from_spring_ft.y == 3 | Distance_from_spring_ft.x == 3, gap > 0) #%>%
+  #select(sample_id, name, value, Sampling_date.x, Sampling_date.y, Distance_from_spring_ft.x, Distance_from_spring_ft.y, gap)
+
+bc_dist %>% #issue, can't have a BC-dist greater than 1. 
+  as.matrix() %>%
+  as_tibble(rownames = "sample_id") %>%
+   pivot_longer(-sample_id) %>%
+  filter(sample_id < name) %>%
+  left_join(map,
+            by = c("sample_id" = "Sample_ID")) %>%
+  left_join(map,
+            by = c("name" = "Sample_ID")) %>% 
+  mutate(Distance_from_spring_ft.x = as.numeric(levels(Distance_from_spring_ft.x))[Distance_from_spring_ft.x],
+         Distance_from_spring_ft.y = as.numeric(levels(Distance_from_spring_ft.y))[Distance_from_spring_ft.y],
+    gap = abs(Distance_from_spring_ft.x - Distance_from_spring_ft.y),
+    dist = if_else(Distance_from_spring_ft.y > Distance_from_spring_ft.x, Distance_from_spring_ft.y, Distance_from_spring_ft.x)) %>%
+  filter(Sampling_date.x == Sampling_date.y, Distance_from_spring_ft.x == 0 | Distance_from_spring_ft.y == 0, gap > 0) %>%
+  #select(sample_id, name, value, Sampling_date.x, Sampling_date.y, Distance_from_spring_ft.x, Distance_from_spring_ft.y, gap)
+  rbind(y) %>%
+  ggplot(aes(x = dist, y = value, color = Sampling_date.x, group=paste0(Sampling_date.x, Replicate_Number.x))) +
+  geom_jitter(size = 2, position = position_jitter(0.3), alpha = 0.5) +
+  #geom_line(size = 0.75) +
+  geom_smooth(aes(group=Sampling_date.x), se=F, size=1.5) +
+  labs(x="Distance (ft) from Source",
+       y="Bray-Curtis Distance to \nInitial Sampling Location") +
+  theme_classic() +
+  scale_x_continuous(limits = c(3, 15), breaks = seq(3,15, 3), expand = expansion(mult = c(0.01, 0.04))) +
+  scale_y_continuous(limits = c(0.8, 1), breaks = seq(0.8, 1, 0.05), expand = expansion(add = c(0.01,0.01))) +
+  viridis::scale_color_viridis(name = "Date", discrete = TRUE, option="plasma", direction = 1, begin = 0.95, end = 0) +
+  guides(color = guide_legend(override.aes = list(shape=NA))) +
+  theme(axis.text = element_text(size=10, color = "black"),
+        axis.title = element_text(size = 14, color = "black"),
+        plot.margin = margin(t = 0.55, r = 0.1, b = 0.2, l = 0.2, unit = "cm"))
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/AlphaBeta/AltToOrd/source_bc.pdf", width = 10, height = 7)
+```
+
+Jitter plot comparing ecological distances categorically. Looking at the distribution of distances when time is varied or distance.
+```{r}
+jit_df <- bc_dist %>%
+  as.matrix() %>%
+  as_tibble(rownames = "sample_id") %>%
+   pivot_longer(-sample_id) %>%
+  filter(sample_id < name) %>%
+  left_join(map,
+            by = c("sample_id" = "Sample_ID")) %>%
+  left_join(map,
+            by = c("name" = "Sample_ID")) %>% 
+  mutate(Distance_from_spring_ft.x = as.numeric(levels(Distance_from_spring_ft.x))[Distance_from_spring_ft.x],
+         Distance_from_spring_ft.y = as.numeric(levels(Distance_from_spring_ft.y))[Distance_from_spring_ft.y],
+    gap = abs(Distance_from_spring_ft.x - Distance_from_spring_ft.y),
+    dist = if_else(Distance_from_spring_ft.y > Distance_from_spring_ft.x, Distance_from_spring_ft.y, Distance_from_spring_ft.x),
+    tgap = abs(DaysSince_t0.x - DaysSince_t0.y),
+    day = if_else(DaysSince_t0.y > DaysSince_t0.x, DaysSince_t0.y, DaysSince_t0.x)) %>%
+  mutate(cata = case_when(
+    Distance_from_spring_ft.x == Distance_from_spring_ft.y & Sampling_date.x != Sampling_date.y ~ "Time var",
+    Distance_from_spring_ft.x != Distance_from_spring_ft.y & Sampling_date.x == Sampling_date.y ~ "Loc var",
+    Distance_from_spring_ft.x == Distance_from_spring_ft.y & Sampling_date.x == Sampling_date.y ~ "Rep var",
+    Distance_from_spring_ft.x != Distance_from_spring_ft.y & Sampling_date.x != Sampling_date.y ~ "T/loc var",
+    TRUE ~ NA_character_),
+    cata = factor(cata, levels = c("Time var", "Loc var", "Rep var", "T/loc var"))
+  ) %>%
+  drop_na()
+jit_df %>%  ggplot(aes(x = cata, y = value)) +
+  geom_jitter(size = 2, width = 0.25, height = 0.005, alpha = 0.5, aes(color = cata), show.legend = F) +
+  stat_summary(fun.data=median_hilow, color="black", size=0.5,
+               fun.args = list(conf.int=0.50), position = position_nudge(x = .32)) +
+  theme_classic() + 
+  labs(x=NULL, y="Bray-Curtis Distance") +
+  scale_x_discrete(breaks=c("Time var", "Loc var", "Rep var", "T/loc var"),
+                   labels=c("Temporal \nVariance",
+                            "Spatial \nVariance",
+                            "Replicate \nVariance",
+                            "Temporal-Spatial \nVariance")) +
+  scale_y_continuous(limits=c(0, 1), breaks=seq(0, 1, 0.2), expand = expansion(mult = c(0., 0.02))) +
+  viridis::scale_color_viridis(name = "Date", discrete = TRUE, option="mako", direction = 1, begin = 0.8, end = 0.3) +
+  theme(axis.ticks = element_line(color = "black"),
+        axis.text = element_text(size=10, color = "black"),
+        axis.title = element_text(size = 14, color = "black"))
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/AlphaBeta/AltToOrd/betavariance_bc.pdf", width = 10, height = 7)
+```
+
+ # Statistical Tests for Beta Diversity #
+PERMANOVA test = adonis test in vegan
+OVERALL
+!!!If 2017 samples are being added to these stats, check line 1450 to see if 2017 samples are being filtered to make the bc_dist. It should be filtered out for stats since 2017 only had 2 samples both at the source !!!!
+```{r}
+set.seed(13)
+bc_stat <- adonis2(unname(bc_dist) ~ Sampling_date*Distance_from_spring_ft, data = map, permutatons = 10000, by = "terms") #if doing adonis, have to add the unname() arugment for it to work due to conflicts with an additional package (DescTools). can change "terms" to "margin" to only asses the variables together. 
+
+#pulling p-values, couldn't get a function to work properly here.
+s1 <- bc_stat['Pr(>F)'] %>%
+  as_tibble() %>%
+  rename(p.value = 'Pr(>F)') %>%
+  mutate(adj.p.value = p.adjust(p.value, method = 'BH'),
+         test.var = row.names(bc_stat),
+         sig = adj.p.value < 0.05,
+         #method = 'bc'
+  ) %>%
+drop_na(p.value)
+y <- bc_stat['R2'] %>%
+  as_tibble() %>%
+  mutate(test.var = row.names(bc_stat))
+x <- merge(s1, y, by = 'test.var')
+write.csv(x, file = "/Users/kalen/Documents/YNP_Project/16S/SC_Overall/beta_permanova_sig.csv")
+```
+Sampling date and the sampling date:distance interaction is statistically significant for all three types of distance matrices. Which tells us that groups have differences in OTUs present AND different abundances of those OTUs across time. 
+
+Pairwise comparisons
+We now know sampling date is statistically significant, but now I want to determine specifically which pairs of sampling dates are statistically different from one another. 
+```{r}
+library(pairwiseAdonis) # Both functions now use adonis2 instead of adonis
+```
+
+examples of functions
+```{r}
+set.seed(13)
+pairwise.adonis(bc_dist, map$Sampling_date, perm = 1000) #does not accept interaction between factors, has adjusted p.values
+pair.p <- pairwise.adonis2(bc_dist ~ Sampling_date*Distance_from_spring_ft, data = map, perm = 1000) #need to adjust p.values
+#since the interaction term is significant in the above overall stats test, it makes more sense to move forward with it. 
+pair.p <- pairwise.adonis2(bc_dist ~ Distance_from_spring_ft*Sampling_date, data = map, perm = 1000)
+
+vec <- names(pair.p)[-1] #vector of pairwise comparisons
+#example of function below
+pair.p[[vec[1]]][['Pr(>F)']] %>%
+  as_tibble() %>%
+  rename(p.value = value) %>%
+  mutate(adj.p.value = p.adjust(p.value, method = 'BH'),
+         test.var = row.names(pair.p[[vec[1]]]), 
+         pair = vec[1],
+         sig = adj.p.value < 0.05
+         ) %>%
+  drop_na(p.value) %>%
+  separate(pair, c("var1", "var2"), sep = "_vs_")
+pair.p[[vec[1]]][['R2']] %>%
+  as_tibble() %>%
+  mutate(test.var = row.names(pair.p[[vec[1]]])) %>%
+  rename(R2 = value)
+```
+
+Function to pull out all of the p.values from all the pairwise comparisons
+```{r}
+adonisloop <- function(v) {
+  d <- pair.p[[v]][['Pr(>F)']] %>%
+  as_tibble() %>%
+  rename(p.value = value) %>%
+  mutate(adj.p.value = p.adjust(p.value, method = 'BH'),
+         test.var = row.names(pair.p[[v]]), 
+         pair = v,
+         sig = adj.p.value < 0.05
+         ) %>%
+  drop_na(p.value) %>%
+  separate(pair, c("var1", "var2"), sep = "_vs_", remove = FALSE)
+  r <- pair.p[[v]][['R2']] %>%
+  as_tibble() %>%
+  mutate(test.var = row.names(pair.p[[v]])) %>%
+  rename(R2 = value)
+x <- merge(d, r, by = 'test.var')
+}
+```
+
+Running pairwise adnois tests and compiling data.
+pairwise is between 2 locations or times across all times or locations
+!!!If 2017 samples are being added to these stats check like 1450 to see if 2017 samples are being filtered to make the bc_dist. It should be filtered out for stats since 2017 only had 2 samples both at the source !!!!
+```{r}
+set.seed(13)
+pair.p <- pairwise.adonis2(bc_dist ~ Distance_from_spring_ft, data = map, perm = 10000)
+vec <- names(pair.p)[-1]
+dis.adonis.pairwise <- purrr::map_dfr(.x = vec, .f = adonisloop)
+
+pair.p <- pairwise.adonis2(bc_dist ~ Sampling_date, data = map, perm = 10000)
+vec <- names(pair.p)[-1]
+time.adonis.pairwise <- purrr::map_dfr(.x = vec, .f = adonisloop)
+
+x <- rbind(dis.adonis.pairwise, time.adonis.pairwise) %>%
+  filter(sig == TRUE)
+
+write.csv(x, file = "/Users/kalen/Documents/YNP_Project/16S/SC_Overall/beta_pairwise_sig.csv")
+```
+
+Jitter Variance stats test
+```{r}
+jit_df %>% 
+  group_by(cata) %>%
+  summarise(mean = mean(value),
+            median = median(value),
+            var = var(value),
+            iqr = IQR(value),
+            n = n(), 
+            sd = sd(value)
+  )
+
+#Shapiro-Wilk test of normality
+shapiro.test(jit_df$value) #the p-value is below 0.05, therefore the hypothesis that the data are not normally distributed is statistically supported. A p-value above 0.05 would support the null hypothesis that the data are normal. 
+
+#Kruskal Wallis tests. Allows for testing across multiple categorical entries. In this case 6 for Distance and 7 for date. 
+kruskal.test(value ~ cata, data=jit_df) #is significant
+
+jit_df  %>%
+  #group_by(cata) %>%
+  rstatix::pairwise_wilcox_test(value ~ cata, p.adjust.method = "fdr") %>%
+  filter(p < 0.05) %>% 
+  rstatix::add_significance("p")
+```
+
+Beta Dispersion into Anova-like statistical test - test this statistically with multivariate homogeneity of group dispersion (variances)
+```{r}
+set.seed(13)
+#Bray Curtis distance
+bddis.bc <- betadisper(bc_dist, map$Distance_from_spring_ft)
+y <- permutest(bddis.bc, pairwise = TRUE, permutations = 10000)
+
+betadis_stat.bc <- y$tab$`Pr(>F)`
+
+bdis_stats.pw.bc <- y[['pairwise']][['permuted']] %>%
+  as.data.frame() %>%
+  rename(p.value = '.') %>%
+  rownames_to_column("pair") %>%
+  mutate(adj.p.value = p.adjust(p.value, method = 'BH'),
+         sig = adj.p.value < 0.05,
+          group = 'sample_date'
+         ) %>%
+  separate(pair, c("var1", "var2"), sep = "-", remove = FALSE) %>%
+  mutate(var2 = str_replace(var2, "-", ""))
+
+
+bddate.bc <- betadisper(bc_dist, map$Sampling_date)
+y <- permutest(bddate.bc, pairwise = TRUE, permutations = 10000)
+
+betadate_stat.bc <- y$tab$`Pr(>F)`
+
+bdate_stats.pw.bc <- y[['pairwise']][['permuted']] %>%
+  as.data.frame() %>%
+  rename(p.value = '.') %>%
+  rownames_to_column("pair") %>%
+  mutate(adj.p.value = p.adjust(p.value, method = 'BH'),
+         sig = adj.p.value < 0.05,
+          group = 'sample_date'
+         ) %>%
+  separate(pair, c("var1", "var2"), sep = "-20", remove = FALSE) %>%
+  mutate(var2 = paste("20", var2, sep = ""))
+
+x <- rbind(bdis_stats.pw.bc, bdate_stats.pw.bc) %>%
+  filter(sig == TRUE)
+
+write.csv(x, file = "/Users/kalen/Documents/YNP_Project/16S/SC_Overall/betadispersion_pairwise_sig.csv")
+```
+beta dispersion is not statistically significant for sampling date or distance over the entire dataset. However, some pairwise comparisons are statistically significant. 
+
+
+---SIMPER Analysis of BC beta diversity
+SIMPER analysis to determine which ASVs impact beta diversity - uses Bray-Curtis method of similarly 
+input = SMU.Biofilm.beta (not normalized); OTU = asv2, Meta = map, tax_table = tax
+running SIMPER analysis and then Kruskal-Wallis to determine significance.
+using two R scripts to perform this analysis found here: https://github.com/asteinberger9/seq_scripts
+I am going to condense the samples down from individual ASVs at the genus level. 
+```{r, message=FALSE}
+asv2 <- SMU.Biofilm.beta %>%
+  microViz::tax_fix() %>%
+  tax_glom(taxrank = "Genus", NArm = FALSE)
+asv2 <- prune_taxa(taxa_sums(asv2) > 0, asv2) #removing any asvs with 0 reads total. 
+asv2 <- as.matrix(otu_table(asv2)) %>% # this is my OTU table
+  data.frame() %>%
+  t()#transposing because asvs need to be rows for the simper function
+#can check to see the number of observations per sample with colSums(asv2), this number should be what samples were rarefied to. Which it does. 
+
+tax <- SMU.Biofilm.beta %>%
+  microViz::tax_fix() %>%
+  tax_glom(taxrank = "Genus", NArm = FALSE)
+tax <- prune_taxa(taxa_sums(tax) > 0, tax)
+tax <- as.matrix(tax_table(tax)) %>%
+  data.frame() %>%
+  rownames_to_column(var = "OTU")
+```
+
+```{r}
+source("/Users/kalen/Documents/Bioinformatics/seq_scripts-master/simper_pretty.R")
+source("/Users/kalen/Documents/Bioinformatics/seq_scripts-master/R_krusk.R")
+```
+
+Running SIMPER analysis and stats test - Sampling Date
+```{r}
+simper.pretty(asv2, map, c('Sampling_date'), perc_cutoff=1, low_cutoff = 'y', low_val=0.005, 'date') #all SIMPER OTUs (perc_cutoff = 1, meaning up to cumulative 100%) but cutoff any OTUs that individually contribute less than 1% to SIMPER (low_val=0.005) - outputs to pwd in r files
+simper.results <- data.frame(read.csv("date_clean_simper.csv")) #outputs to pwd
+kruskal.pretty(asv2, map, simper.results, c('Sampling_date'), 'date') #running stats
+KW.results <- data.frame(read.csv("date_krusk_simper.csv")) %>%
+  merge(tax, by = 'OTU') #adding in taxonomy
+#trimming down to only significant results
+KW.results.sig <- KW.results[KW.results$fdr_krusk_p.val < 0.05,]
+KW.results.sig <- KW.results.sig %>%
+  separate(Comparison, c("var1", "var2"), sep = "_", remove = FALSE)
+KW.results.sig[,14] <- substring(KW.results.sig[,14], 4)
+KW.results.sig[,15] <- substring(KW.results.sig[,15], 4)
+KW.results.sig[,16] <- substring(KW.results.sig[,16], 4)
+KW.results.sig[,17] <- substring(KW.results.sig[,17], 4)
+KW.results.sig[,18] <- substring(KW.results.sig[,18], 4)
+KW.results.sig[,19] <- substring(KW.results.sig[,19], 4)
+length(unique(KW.results.sig$Genus))
+unique(KW.results.sig$Genus)
+write.csv(KW.results.sig, file = "/Users/kalen/Documents/YNP_Project/16S/SC_Overall/date_simper_sig.csv")
+```
+30 unique genera were determined to be statistically different across sampling date. 
+
+SIMPER analysis and stats test - Distance along spring.
+```{r}
+simper.pretty(asv2, map, c('Distance_from_spring_ft'), perc_cutoff=1, low_cutoff = 'y', low_val=0.005, 'dis') #all SIMPER OTUs (perc_cutoff = 1, meaning up to cumulative 100%) but cutoff any OTUs that individually contribute less than 1% to SIMPER (low_val=0.005) - outputs to pwd in r files
+simper.results.dis <- data.frame(read.csv("dis_clean_simper.csv")) #outputs to pwd
+kruskal.pretty(asv2, map, simper.results.dis, c('Distance_from_spring_ft'), 'dis') #running stats
+KW.results.dis <- data.frame(read.csv("dis_krusk_simper.csv")) %>%
+  merge(tax, by = 'OTU') #adding in taxonomy
+#trimming down to only significant results
+KW.results.dis.sig <- KW.results.dis[KW.results.dis$fdr_krusk_p.val < 0.05,]
+KW.results.dis.sig <- KW.results.dis.sig %>%
+  separate(Comparison, c("var1", "var2"), sep = "_", remove = FALSE)
+length(unique(KW.results.dis.sig$Genus))
+```
+0 genera were determined to be statistically different across distance. 
+
+
+
+
+
+--- Differential Abundance Analysis
+Since using corncob, will use raw counts = SMU.Biofilm.raw (DNA) & Overall.BA to pull out RNA
+Bbdml is a surgical knife, differentialTest is carpet bombing
+```{r}
+library(phyloseq)
+library(microViz)
+library(corncob)
+library(tidyverse)
+```
+
+Prepping data 
+```{r, message = FALSE}
+SMU.Biofilm.RNA.raw <- Overall.BA %>%
+  subset_samples((!Sample_Type %in% c('Filter', 'Lithified', 'Biomass'))&(Transect %in% c("SMU", "Source"))&(Amplicon == 'rRNA')&(!Sample_ID %in% c('YNP015', 'YNP016', 'YNP017'))&(Distance_from_spring_ft %in% c("0", "3", "6", "9", "12", "15"))) %>%
+  microViz::tax_fix() %>%
+  microViz::tax_prepend_ranks() %>%
+  tax_glom(taxrank = "Genus", NArm = FALSE)
+SMU.Biofilm.RNA.raw <- prune_taxa(taxa_sums(SMU.Biofilm.RNA.raw) > 0, SMU.Biofilm.RNA.raw) #removing any asvs with 0 reads total
+tax_table(SMU.Biofilm.RNA.raw)@.Data <- substring(tax_table(SMU.Biofilm.RNA.raw)@.Data[,1:7], 4) #trim first 3 characters in the string across the df
+
+sample_data(SMU.Biofilm.RNA.raw) %>%
+  write.csv("/Users/kalen/Documents/YNP_Project/16S/SC_Overall/scRNA_melt.csv", row.names = FALSE)
+
+SMU.Biofilm.DNA.raw <- SMU.Biofilm.raw %>%
+  microViz::tax_fix() %>%
+  microViz::tax_prepend_ranks() %>%
+  tax_glom(taxrank = "Genus", NArm = FALSE)
+SMU.Biofilm.DNA.raw <- prune_taxa(taxa_sums(SMU.Biofilm.DNA.raw) > 0, SMU.Biofilm.DNA.raw) #removing any asvs with 0 reads total
+tax_table(SMU.Biofilm.DNA.raw)@.Data <- substring(tax_table(SMU.Biofilm.DNA.raw)@.Data[,1:7], 4) #trim first 3 characters in the string across the df to remove the characters used for GCN. 
+```
+
+ #DNA DA Analysis#
+Diff Abund. temporally
+```{r}
+# SMU.Biofilm.DNA.raw@sam_data$Sampling_date <- sub("-", "_", SMU.Biofilm.DNA.raw@sam_data$Sampling_date)
+# SMU.Biofilm.DNA.raw@sam_data$Sampling_date <- sub("-", "_", SMU.Biofilm.DNA.raw@sam_data$Sampling_date) #have to run twice bc two
+```
+
+Function [extractCoefficients] to extract the coefficient values from the significant taxa.
+```{r}
+extractCoefficients <- function(diftest_res, taxa){
+#add names to all_models list
+  names(diftest_res$all_models) <- taxa_names(diftest_res$data)
+  # default is all taxa
+  if (missing(taxa)) {
+    taxa <- taxa_names(diftest_res$data)
+  } else {
+    taxa <- taxa
+  }
+  purrr::map(
+    diftest_res$all_models[taxa],
+    ~ stats::coef(.))
+}
+```
+
+DF and vector for DA analysis at specific location for pairwise dates. 
+Performing pairwise comparisons like this, because when using the contrastsTests function in corncob I got different results than when doing them individually. Differentialtests was in the original build and paper for the package and has been vetted more, therefore I am more comfortable using this function than contrasttests.
+```{r}
+DA.temp.matrix <- data.frame(dis = rep(c("3", "6", "9", "12", "15"), each = 6),
+                             baseline = rep.int(c("2010-6-4", "2018-5-30", "2018-7-26", 
+                                                  "2018-9-29", "2019-8-11", "2010-6-4"), times=5),
+                             effect = rep.int(c("2018-5-30", "2018-7-26", "2018-9-29", 
+                                                "2019-8-11", "2020-8-21", "2020-8-21"), times=5))
+v <- c(1:nrow(DA.temp.matrix))  #vector fed into function.
+```
+
+Function for different differentialtest temporally by pairwise comparisons.
+```{r}
+DA.loop.temp <- function(v) {
+set.seed(13) 
+t <- prune_samples(sample_data(SMU.Biofilm.DNA.raw)$Distance_from_spring_ft == DA.temp.matrix[v,1] 
+                & sample_data(SMU.Biofilm.DNA.raw)$Sampling_date %in% c(DA.temp.matrix[v,2], DA.temp.matrix[v,3]),
+                SMU.Biofilm.DNA.raw)
+    
+# t <- SMU.Biofilm.DNA.raw %>%
+#   subset_samples(Distance_from_spring_ft == x & Sampling_date %in% c(y, z))
+
+t2 <-  differentialTest(data = t,
+                   formula = ~Sampling_date,
+                   phi.formula = ~Sampling_date,
+                   formula_null = ~1,
+                   phi.formula_null = ~Sampling_date,
+                   test = "Wald", boot = F,
+                   fdr_cutoff = 0.05,
+                   fdr = "BH") #sometimes referred to fdr type correction.
+
+df1 <- extractCoefficients(t2, t2$significant_taxa)
+df2 <- plyr::ldply(df1, data.frame, .id = "ASV") %>%
+  mutate(variable = rep.int(rownames(df1[[1]]), times = length(t2$significant_taxa)),
+        variable = gsub(toString(t2[["restrictions_DA"]]), "", variable)) %>% #removing effect information from mu and phi strings. May be able to remove the toString function once filtering is fixed.
+  rename("std.err" = "Std..Error",
+         "Pr.t" = "Pr...t..")
+df3 <- t2$p_fdr[t2$significant_taxa] %>%
+  data.frame() %>%
+  rownames_to_column(var = "ASV") %>%
+  rename("p_fdr" = ".")
+df4 <- merge(df2, df3, by = "ASV")
+
+df5 <- t2$data@tax_table %>%
+  data.frame() %>%
+  rownames_to_column(var = "ASV") %>%
+  mutate(Species = NULL,
+         Distance = DA.temp.matrix[v,1],
+         effect = toString(t2[["restrictions_DA"]]), #if filtering is fixed can remove the toString
+         effect = gsub('Sampling_date', "", effect),
+         comparison = unique(t2$data@sam_data$Sampling_date) %>% paste(collapse = 'vs')) %>%
+  separate(comparison, c("var1", "var2"), sep = "vs", remove = FALSE) %>% #not working because pulling in too many comparisons
+  mutate(baseline = ifelse(var1 == effect, var2, var1),
+         var1 = NULL,
+         var2 = NULL)
+
+#df5$effect <- gsub('Sampling_date', "", df5$effect) #if above gsub works don't need this one.
+
+df6 <- merge(df4, df5, by = "ASV") %>%
+  relocate(ASV, variable)
+}
+```
+pmap_dfr(.x, .y, .z)
+cross() #run all pairwise comparisons
+
+Old code for testing to see if able to pull out proper data. 
+```{r}
+set.seed(13) 
+t <- SMU.Biofilm.DNA.raw %>%
+  subset_samples(Distance_from_spring_ft == "3" & Sampling_date %in% c("2018_7_26", "2018_5_30"))
+t <- SMU.Biofilm.DNA.raw %>%
+  subset_samples(Distance_from_spring_ft == DA.temp.matrix[2,1] & Sampling_date %in% DA.temp.matrix[2,2:3])
+
+t2 <-  differentialTest(data = t,
+                   formula = ~Sampling_date,
+                   phi.formula = ~Sampling_date,
+                   formula_null = ~1,
+                   phi.formula_null = ~Sampling_date,
+                   test = "Wald", boot = F,
+                   fdr_cutoff = 0.05,
+                   fdr = "BH") #yields 6 sig taxa
+
+df1 <- extractCoefficients(t2, t2$significant_taxa)
+df2 <- plyr::ldply(df1, data.frame, .id = "ASV") %>%
+  mutate(variable = rep.int(rownames(df1[[1]]), times = length(t2$significant_taxa)),
+         variable = gsub(t2[["restrictions_DA"]], "", variable)) %>% #removing effect information from mu and phi strings.
+  rename("std.err" = "Std..Error",
+         "Pr.t" = "Pr...t..")
+df3 <- t2$p_fdr[t2$significant_taxa] %>%
+  data.frame() %>%
+  rownames_to_column(var = "ASV") %>%
+  rename("p_fdr" = ".")
+df4 <- merge(df2, df3, by = "ASV")
+
+df5 <- t2$data@tax_table %>%
+  data.frame() %>%
+  rownames_to_column(var = "ASV") %>%
+  mutate(Species = NULL,
+         Genus = gsub("^[^ ]* ", "", Genus), #removing to first space
+         Family = gsub("^[^ ]* ", "", Family),
+         Order = gsub("^[^ ]* ", "", Order),
+         Class = gsub("^[^ ]* ", "", Class),
+         Phylum = gsub("^[^ ]* ", "", Phylum),
+         Kingdom = gsub("^[^ ]* ", "", Kingdom),
+         Distance = DA.temp.matrix[v,1],
+         effect = toString(t2[["restrictions_DA"]]),
+         effect = gsub('Sampling_date', "", effect),
+         comparison = unique(t2$data@sam_data$Sampling_date) %>% paste(collapse = 'vs')) %>%
+  separate(comparison, c("var1", "var2"), sep = "vs", remove = FALSE) %>%
+  mutate(baseline = ifelse(var1 == effect, var2, var1),
+         var1 = NULL,
+         var2 = NULL)
+
+df6 <- merge(df4, df5, by = "ASV") %>%
+  relocate(ASV, variable)
+```
+
+Running DA analysis loop on temporal comparisons. 
+```{r}
+temp.da.sigtax <- purrr::map_dfr(.x = v, .f = DA.loop.temp, .id = "loop")
+```
+
+Pulling out DA information for plotting
+```{r}
+qval <- stats::qnorm(.975)
+
+temp.da.sigtax %>%
+  filter(variable == "mu.") %>% #Coefficients indicate the mean change in relative abundance (±standard error of the mean) of the ASVs.
+  mutate(Errmin = Estimate - qval * std.err,
+         Errmax = Estimate + qval * std.err,
+         Distance = factor(Distance, levels = Dist.Order),
+         comparison = factor(comparison, levels = c("2018-5-30vs2010-6-4", "2018-5-30vs2018-7-26", "2018-7-26vs2018-9-29", "2018-9-29vs2019-8-11", "2019-8-11vs2020-8-21", "2010-6-4vs2020-8-21")),
+         Distance = factor(Distance, labels = c("1", "2", "3", "4", "5"))) %>%
+  ggplot(aes(x = Estimate, y = Genus)) +
+      geom_vline(xintercept = 0, color = "black", lty = "dashed", alpha = 0.75, lwd = 0.5) +
+      geom_point() +
+      geom_errorbarh(aes(xmin = Errmin, xmax = Errmax), height = .3) +
+      theme_bw() +
+  labs(title = "", x = "Fold Difference", y = "Taxa") +
+      scale_x_continuous(breaks = scales::pretty_breaks(n = 5)) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_grid(rows = vars(Distance), cols = vars(comparison), scales = "free_y", space = "free_y") +
+  theme(strip.text = element_text(color = "black"),
+        strip.text.y = element_text(angle = 0),
+        axis.text = element_text(color = "black"),
+        strip.background = element_blank(),
+        axis.ticks = element_line(color = "black"),
+        panel.border = element_rect(color = "black", fill = NA))
+
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/DA_analysis/DA_dna_temp.pdf", width = 12, height = 19)
+```
+
+DA spatially
+```{r}
+DA.dist.matrix <- data.frame(date = rep(c("2010-6-4", "2018-5-30", "2018-7-26", "2018-9-29", "2019-8-11", "2020-8-21"), each = 4),
+                             baseline = rep.int(c("3", "6", "9", "12"), times = 6),
+                             effect = rep.int(c("6", "9", "12", "15"), times = 6))
+v <- c(1:nrow(DA.dist.matrix))  #vector fed into function.
+```
+ 
+Function for different differentialtest spatially by pairwise comparisons.
+```{r}
+DA.loop.dist <- function(v) {
+set.seed(13) 
+t <- prune_samples(sample_data(SMU.Biofilm.DNA.raw)$Sampling_date == DA.dist.matrix[v,1] 
+                & sample_data(SMU.Biofilm.DNA.raw)$Distance_from_spring_ft %in% c(DA.dist.matrix[v,2], DA.dist.matrix[v,3]),
+                SMU.Biofilm.DNA.raw)
+t@sam_data$Distance_from_spring_ft <- as.character(t@sam_data$Distance_from_spring_ft) 
+    
+# t <- SMU.Biofilm.DNA.raw %>%
+#   subset_samples(Distance_from_spring_ft == x & Sampling_date %in% c(y, z))
+
+t2 <- differentialTest(data = t,
+                   formula = ~Distance_from_spring_ft,
+                   phi.formula = ~Distance_from_spring_ft,
+                   formula_null = ~1,
+                   phi.formula_null = ~Distance_from_spring_ft,
+                   test = "Wald", boot = F,
+                   fdr_cutoff = 0.05,
+                   fdr = "BH") #sometimes referred to fdr type correction.
+
+df1 <- extractCoefficients(t2, t2$significant_taxa)
+df2 <- plyr::ldply(df1, data.frame, .id = "ASV") %>%
+  mutate(variable = rep.int(rownames(df1[[1]]), times = length(t2$significant_taxa)),
+        variable = gsub(toString(t2[["restrictions_DA"]]), "", variable)) %>% #removing effect information from mu and phi strings. May be able to remove the toString function once filtering is fixed.
+  rename("std.err" = "Std..Error",
+         "Pr.t" = "Pr...t..")
+df3 <- t2$p_fdr[t2$significant_taxa] %>%
+  data.frame() %>%
+  rownames_to_column(var = "ASV") %>%
+  rename("p_fdr" = ".")
+df4 <- merge(df2, df3, by = "ASV")
+
+df5 <- t2$data@tax_table %>%
+  data.frame() %>%
+  rownames_to_column(var = "ASV") %>%
+  mutate(Species = NULL,
+         date = DA.dist.matrix[v,1],
+         effect = t2[["restrictions_DA"]], #if filtering is fixed can remove the toString
+         effect = gsub('Distance_from_spring_ft', "", effect),
+         comparison = unique(t2$data@sam_data$Distance_from_spring_ft) %>% paste(collapse = 'vs')) %>%
+  separate(comparison, c("var1", "var2"), sep = "vs", remove = FALSE) %>% #not working because pulling in too many comparisons
+  mutate(baseline = ifelse(var1 == effect, var2, var1),
+         var1 = NULL,
+         var2 = NULL)
+
+#df5$effect <- gsub('Sampling_date', "", df5$effect) #if above gsub works don't need this one.
+
+df6 <- merge(df4, df5, by = "ASV") %>%
+  relocate(ASV, variable)
+}
+```
+
+Running DA analysis loop on temporal comparisons. 
+```{r}
+dist.da.sigtax <- purrr::map_dfr(.x = v, .f = DA.loop.dist, .id = "loop")
+```
+
+Pulling out DA information for plotting
+```{r}
+qval <- stats::qnorm(.975)
+
+dist.da.sigtax %>%
+  filter(variable == "mu.") %>% #Coefficients indicate the mean change in relative abundance (±standard error of the mean) of the ASVs.
+  mutate(Errmin = Estimate - qval * std.err,
+         Errmax = Estimate + qval * std.err,
+         date = factor(date, levels = date_vector),
+         comparison = factor(comparison, levels = c("3vs6", "6vs9", "9vs12", "12vs15"),
+                             labels = c("1 vs 2", "2 vs 3", "3 vs 4", "4 vs 5"))) %>%
+  ggplot(aes(x = Estimate, y = Genus)) +
+      geom_vline(xintercept = 0, color = "black", lty = "dashed", alpha = 0.75, lwd = 0.5) +
+      geom_point() +
+      geom_errorbarh(aes(xmin = Errmin, xmax = Errmax), height = .3) +
+      theme_bw() +
+  labs(title = "", x = "Fold Difference", y = "Taxa") +
+      scale_x_continuous(breaks = scales::pretty_breaks(n = 5)) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_grid(rows = vars(comparison), cols = vars(date), scales = "free_y", space = "free_y") +
+  theme(strip.text = element_text(color = "black"),
+        strip.text.y = element_text(angle = 0),
+        axis.text = element_text(color = "black"),
+        strip.background = element_blank(),
+        axis.ticks = element_line(color = "black"),
+        panel.border = element_rect(color = "black", fill = NA))
+
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/DA_analysis/DA_dna_spat.pdf", width = 12, height = 19)
+```
+
+ #RNA DNA Analysis#
+Diff. Abund. temporally - SMU.Biofilm.RNA.raw
+Dates with RNA: "2018-9-29" "2019-8-11" "2020-8-21"
+```{r}
+rna.temp.matrix <- data.frame(dis = rep(c("3", "6", "9", "12", "15"), each = 2),
+                             baseline = rep.int(c("2018-9-29", "2019-8-11"), times=5),
+                             effect = rep.int(c("2019-8-11", "2020-8-21"), times=5))
+v.rna <- c(1:nrow(rna.temp.matrix))  #vector fed into function.
+```
+
+RNA Function for different differentialtest temporally by pairwise comparisons.
+```{r}
+rna.DA.loop.temp <- function(v) {
+set.seed(13) 
+t <- phyloseq::prune_samples(sample_data(SMU.Biofilm.RNA.raw)$Distance_from_spring_ft == rna.temp.matrix[v,1] 
+                & sample_data(SMU.Biofilm.RNA.raw)$Sampling_date %in% c(rna.temp.matrix[v,2], rna.temp.matrix[v,3]),
+                SMU.Biofilm.RNA.raw)
+    
+# t <- SMU.Biofilm.RNA.raw %>%
+#   subset_samples(Distance_from_spring_ft == x & Sampling_date %in% c(y, z))
+
+t2 <- corncob::differentialTest(data = t,
+                   formula = ~Sampling_date,
+                   phi.formula = ~Sampling_date,
+                   formula_null = ~1,
+                   phi.formula_null = ~Sampling_date,
+                   test = "Wald", boot = F,
+                   fdr_cutoff = 0.05,
+                   fdr = "BH") #sometimes referred to fdr type correction.
+
+df1 <- extractCoefficients(t2, t2$significant_taxa)
+df2 <- plyr::ldply(df1, data.frame, .id = "ASV") %>%
+  mutate(variable = rep.int(rownames(df1[[1]]), times = length(t2$significant_taxa)),
+        variable = gsub(toString(t2[["restrictions_DA"]]), "", variable)) %>% #removing effect information from mu and phi strings. May be able to remove the toString function once filtering is fixed.
+  rename("std.err" = "Std..Error",
+         "Pr.t" = "Pr...t..")
+df3 <- t2$p_fdr[t2$significant_taxa] %>%
+  data.frame() %>%
+  rownames_to_column(var = "ASV") %>%
+  rename("p_fdr" = ".")
+df4 <- merge(df2, df3, by = "ASV")
+
+df5 <- t2$data@tax_table %>%
+  data.frame() %>%
+  rownames_to_column(var = "ASV") %>%
+  mutate(Species = NULL,
+         Distance = rna.temp.matrix[v,1],
+         effect = toString(t2[["restrictions_DA"]]), #if filtering is fixed can remove the toString
+         effect = gsub('Sampling_date', "", effect),
+         comparison = unique(t2$data@sam_data$Sampling_date) %>% paste(collapse = 'vs')) %>%
+  separate(comparison, c("var1", "var2"), sep = "vs", remove = FALSE) %>% #not working because pulling in too many comparisons
+  mutate(baseline = ifelse(var1 == effect, var2, var1),
+         var1 = NULL,
+         var2 = NULL)
+
+#df5$effect <- gsub('Sampling_date', "", df5$effect) #if above gsub works don't need this one.
+
+df6 <- merge(df4, df5, by = "ASV") %>%
+  relocate(ASV, variable)
+}
+```
+
+Running DA loop on RNA for temporal analysis
+```{r}
+temp.da.rna <- purrr::map_dfr(.x = v.rna, .f = rna.DA.loop.temp, .id = "loop")
+```
+
+plotting - RNA temporal
+```{r}
+qval <- stats::qnorm(.975)
+
+temp.da.rna %>%
+  filter(variable == "mu.") %>% #Coefficients indicate the mean change in relative abundance (±standard error of the mean) of the ASVs.
+  mutate(Errmin = Estimate - qval * std.err,
+         Errmax = Estimate + qval * std.err,
+         Distance = factor(Distance, levels = Dist.Order),
+         comparison = factor(comparison, levels = c("2018-9-29vs2019-8-11", "2019-8-11vs2020-8-21")),
+         Distance = factor(Distance, labels = c("1", "2", "3", "4", "5"))) %>%
+  ggplot(aes(x = Estimate, y = Genus)) +
+      geom_vline(xintercept = 0, color = "black", lty = "dashed", alpha = 0.75, lwd = 0.5) +
+      geom_point() +
+      geom_errorbarh(aes(xmin = Errmin, xmax = Errmax), height = .3) +
+      theme_bw() +
+  labs(title = "", x = "Fold Difference", y = "Taxa") +
+      scale_x_continuous(breaks = scales::pretty_breaks(n = 5)) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_grid(rows = vars(Distance), cols = vars(comparison), scales = "free_y", space = "free_y") +
+  theme(strip.text = element_text(color = "black"),
+        strip.text.y = element_text(angle = 0),
+        axis.text = element_text(color = "black"),
+        strip.background = element_blank(),
+        axis.ticks = element_line(color = "black"),
+        panel.border = element_rect(color = "black", fill = NA))
+
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/DA_analysis/DA_rna_temp.pdf", width = 8, height = 10)
+```
+
+RNA DA spatially
+```{r}
+rna.dist.matrix <- data.frame(date = rep(c("2018-9-29", "2019-8-11", "2020-8-21"), each = 4),
+                             baseline = rep.int(c("3", "6", "9", "12"), times = 3),
+                             effect = rep.int(c("6", "9", "12", "15"), times = 3))
+v.rna <- c(1:nrow(rna.dist.matrix))  #vector fed into function.
+```
+
+Function for different differentialtest spatially by pairwise comparisons.
+```{r}
+rna.DA.loop.dist <- function(v) {
+set.seed(13) 
+t <- prune_samples(sample_data(SMU.Biofilm.RNA.raw)$Sampling_date == rna.dist.matrix[v,1] 
+                & sample_data(SMU.Biofilm.RNA.raw)$Distance_from_spring_ft %in% c(rna.dist.matrix[v,2], rna.dist.matrix[v,3]),
+                SMU.Biofilm.RNA.raw)
+t@sam_data$Distance_from_spring_ft <- as.character(t@sam_data$Distance_from_spring_ft) 
+    
+# t <- SMU.Biofilm.RNA.raw %>%
+#   subset_samples(Distance_from_spring_ft == x & Sampling_date %in% c(y, z))
+
+t2 <- differentialTest(data = t,
+                   formula = ~Distance_from_spring_ft,
+                   phi.formula = ~Distance_from_spring_ft,
+                   formula_null = ~1,
+                   phi.formula_null = ~Distance_from_spring_ft,
+                   test = "Wald", boot = F,
+                   fdr_cutoff = 0.05,
+                   fdr = "BH") #sometimes referred to fdr type correction.
+
+df1 <- extractCoefficients(t2, t2$significant_taxa)
+df2 <- plyr::ldply(df1, data.frame, .id = "ASV") %>%
+  mutate(variable = rep.int(rownames(df1[[1]]), times = length(t2$significant_taxa)),
+        variable = gsub(toString(t2[["restrictions_DA"]]), "", variable)) %>% #removing effect information from mu and phi strings. May be able to remove the toString function once filtering is fixed.
+  rename("std.err" = "Std..Error",
+         "Pr.t" = "Pr...t..")
+df3 <- t2$p_fdr[t2$significant_taxa] %>%
+  data.frame() %>%
+  rownames_to_column(var = "ASV") %>%
+  rename("p_fdr" = ".")
+df4 <- merge(df2, df3, by = "ASV")
+
+df5 <- t2$data@tax_table %>%
+  data.frame() %>%
+  rownames_to_column(var = "ASV") %>%
+  mutate(Species = NULL,
+         date = rna.dist.matrix[v,1],
+         effect = t2[["restrictions_DA"]], #if filtering is fixed can remove the toString
+         effect = gsub('Distance_from_spring_ft', "", effect),
+         comparison = unique(t2$data@sam_data$Distance_from_spring_ft) %>% paste(collapse = 'vs')) %>%
+  separate(comparison, c("var1", "var2"), sep = "vs", remove = FALSE) %>% #not working because pulling in too many comparisons
+  mutate(baseline = ifelse(var1 == effect, var2, var1),
+         var1 = NULL,
+         var2 = NULL)
+
+#df5$effect <- gsub('Sampling_date', "", df5$effect) #if above gsub works don't need this one.
+
+df6 <- merge(df4, df5, by = "ASV") %>%
+  relocate(ASV, variable)
+}
+```
+
+Running DA loop on RNA for spatial analysis
+```{r}
+dist.da.rna <- purrr::map_dfr(.x = v.rna, .f = rna.DA.loop.dist, .id = "loop")
+```
+
+Pulling out DA information for plotting
+```{r}
+qval <- stats::qnorm(.975)
+
+dist.da.rna %>%
+  filter(variable == "mu.") %>% #Coefficients indicate the mean change in relative abundance (±standard error of the mean) of the ASVs.
+  mutate(Errmin = Estimate - qval * std.err,
+         Errmax = Estimate + qval * std.err,
+         date = factor(date, levels = date_vector),
+         comparison = factor(comparison, levels = c("3vs6", "6vs9", "9vs12", "12vs15"),
+                             labels = c("1 vs 2", "2 vs 3", "3 vs 4", "4 vs 5"))) %>%
+  ggplot(aes(x = Estimate, y = Genus)) +
+      geom_vline(xintercept = 0, color = "black", lty = "dashed", alpha = 0.75, lwd = 0.5) +
+      geom_point() +
+      geom_errorbarh(aes(xmin = Errmin, xmax = Errmax), height = .3) +
+      theme_bw() +
+  labs(title = "", x = "Fold Difference", y = "Taxa") +
+      scale_x_continuous(breaks = scales::pretty_breaks(n = 5)) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_grid(rows = vars(comparison), cols = vars(date), scales = "free_y", space = "free_y") +
+  theme(strip.text = element_text(color = "black"),
+        strip.text.y = element_text(angle = 0),
+        axis.text = element_text(color = "black"),
+        strip.background = element_blank(),
+        axis.ticks = element_line(color = "black"),
+        panel.border = element_rect(color = "black", fill = NA))
+
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/DA_analysis/DA_rna_spat.pdf", width = 8, height = 12)
+```
+
+Combining DNA and RNA results - temporal
+```{r}
+#intersect(temp.da.sigtax$ASV, temp.da.rna$ASV)
+x <- intersect(temp.da.sigtax$Genus, temp.da.rna$Genus) #genera found in both DNA and RNA
+y <- c(setdiff(temp.da.sigtax$Genus, temp.da.rna$Genus), setdiff(temp.da.rna$Genus, temp.da.sigtax$Genus)) #Genera not found in both DNA and RNA
+
+temp.da.sigtax$amplicon <- 'rRNA gene'
+temp.da.rna$amplicon <- 'rRNA'
+
+rbind(temp.da.rna, temp.da.sigtax) %>%
+  filter(Genus %in% x) %>%
+   filter(variable == "mu.") %>% #Coefficients indicate the mean change in relative abundance (±standard error of the mean) of the ASVs.
+  mutate(Errmin = Estimate - qval * std.err,
+         Errmax = Estimate + qval * std.err,
+         Distance = factor(Distance, levels = Dist.Order),
+         comparison = factor(comparison, levels = c("2018-5-30vs2010-6-4", "2018-5-30vs2018-7-26", "2018-7-26vs2018-9-29", "2018-9-29vs2019-8-11", "2019-8-11vs2020-8-21", "2010-6-4vs2020-8-21"))) %>%
+   ggplot(aes(x = Estimate, y = Genus)) +
+      theme_bw() + 
+      geom_vline(xintercept = 0, color = "black", lty = "dashed", alpha = 0.75, lwd = 0.5) +
+      geom_errorbarh(aes(xmin = Errmin, xmax = Errmax), height = 0, 
+                     position = position_jitter(width = 0, height = 0.5, seed = 13)) +
+      geom_point(aes(fill = amplicon), pch = 21, position = position_jitter(width = 0, height = 0.5, seed = 13)) +
+  labs(title = "Both", x = "", y = "Taxa") +
+      scale_x_continuous(breaks = scales::pretty_breaks(n = 5)) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_grid(rows = vars(Distance), cols = vars(comparison), scales = "free_y") +
+  theme(strip.text.y = element_text(angle = 0),
+        strip.background = element_blank()) +
+  viridis::scale_fill_viridis(discrete = TRUE, option="plasma", direction = -1, end = 0.9)
+
+rbind(temp.da.rna, temp.da.sigtax) %>%
+  filter(Genus %in% y) %>%
+   filter(variable == "mu.") %>% #Coefficients indicate the mean change in relative abundance (±standard error of the mean) of the ASVs.
+  mutate(Errmin = Estimate - qval * std.err,
+         Errmax = Estimate + qval * std.err,
+         Distance = factor(Distance, levels = Dist.Order),
+         comparison = factor(comparison, levels = c("2018-5-30vs2010-6-4", "2018-5-30vs2018-7-26", "2018-7-26vs2018-9-29", "2018-9-29vs2019-8-11", "2019-8-11vs2020-8-21", "2010-6-4vs2020-8-21"))) %>%
+  ggplot(aes(x = Estimate, y = Genus)) +
+      theme_bw() + 
+      geom_vline(xintercept = 0, color = "black", lty = "dashed", alpha = 0.75, lwd = 0.5) +
+      geom_errorbarh(aes(xmin = Errmin, xmax = Errmax), height = 0, 
+                     position = position_jitter(width = 0, height = 0.5, seed = 13)) +
+      geom_point(aes(fill = amplicon), pch = 21, position = position_jitter(width = 0, height = 0.5, seed = 13)) +
+  labs(title = "Either", x = "", y = "Taxa") +
+      scale_x_continuous(breaks = scales::pretty_breaks(n = 5)) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_grid(rows = vars(Distance), cols = vars(comparison), scales = "free_y") +
+  theme(strip.text.y = element_text(angle = 0),
+        strip.background = element_blank()) +
+  viridis::scale_fill_viridis(discrete = TRUE, option="plasma", direction = -1, end = 0.9)
+```
+
+Combining DNA and RNA results - spatial
+```{r}
+#intersect(temp.da.sigtax$ASV, temp.da.rna$ASV)
+x <- intersect(dist.da.sigtax$Genus, dist.da.rna$Genus) #genera found in both DNA and RNA
+y <- c(setdiff(dist.da.sigtax$Genus, dist.da.rna$Genus), setdiff(dist.da.rna$Genus, dist.da.sigtax$Genus)) #Genera not found in both DNA and RNA
+
+dist.da.sigtax$amplicon <- 'rRNA gene'
+dist.da.rna$amplicon <- 'rRNA'
+
+rbind(dist.da.rna, dist.da.sigtax) %>%
+  filter(Genus %in% x) %>%
+   filter(variable == "mu.") %>% #Coefficients indicate the mean change in relative abundance (±standard error of the mean) of the ASVs.
+  mutate(Errmin = Estimate - qval * std.err,
+         Errmax = Estimate + qval * std.err,
+        date = factor(date, levels = date_vector),
+         comparison = factor(comparison, levels = c("3vs6", "6vs9", "9vs12", "12vs15"))) %>%
+   ggplot(aes(x = Estimate, y = Genus)) +
+      theme_bw() + 
+      geom_vline(xintercept = 0, color = "black", lty = "dashed", alpha = 0.75, lwd = 0.5) +
+      geom_errorbarh(aes(xmin = Errmin, xmax = Errmax), height = 0, 
+                     position = position_jitter(width = 0, height = 0.5, seed = 13)) +
+      geom_point(aes(fill = amplicon), pch = 21, position = position_jitter(width = 0, height = 0.5, seed = 13)) +
+  labs(title = "Both", x = "", y = "Taxa") +
+      scale_x_continuous(breaks = scales::pretty_breaks(n = 5)) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_grid(rows = vars(comparison), cols = vars(date), scales = "free_y") +
+  theme(strip.text.y = element_text(angle = 0),
+        strip.background = element_blank()) +
+  viridis::scale_fill_viridis(discrete = TRUE, option="plasma", direction = -1, end = 0.9)
+
+rbind(dist.da.rna, dist.da.sigtax) %>%
+  filter(Genus %in% y) %>%
+   filter(variable == "mu.") %>% #Coefficients indicate the mean change in relative abundance (±standard error of the mean) of the ASVs.
+  mutate(Errmin = Estimate - qval * std.err,
+         Errmax = Estimate + qval * std.err,
+        date = factor(date, levels = date_vector),
+         comparison = factor(comparison, levels = c("3vs6", "6vs9", "9vs12", "12vs15"))) %>%
+   ggplot(aes(x = Estimate, y = Genus)) +
+      theme_bw() + 
+      geom_vline(xintercept = 0, color = "black", lty = "dashed", alpha = 0.75, lwd = 0.5) +
+      geom_errorbarh(aes(xmin = Errmin, xmax = Errmax), height = 0, 
+                     position = position_jitter(width = 0, height = 0.5, seed = 13)) +
+      geom_point(aes(fill = amplicon), pch = 21, position = position_jitter(width = 0, height = 0.5, seed = 13)) +
+  labs(title = "Either", x = "", y = "Taxa") +
+      scale_x_continuous(breaks = scales::pretty_breaks(n = 5)) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_grid(rows = vars(comparison), cols = vars(date), scales = "free_y") +
+  theme(strip.text.y = element_text(angle = 0),
+        strip.background = element_blank()) +
+  viridis::scale_fill_viridis(discrete = TRUE, option="plasma", direction = -1, end = 0.9)
+```
+
+General information from DA analysis
+```{r}
+length(unique(temp.da.sigtax$Genus)) #temporal, DNA
+length(unique(dist.da.sigtax$Genus)) #distance, DNA
+length(unique(temp.da.rna$Genus)) #temporal, RNA
+length(unique(dist.da.rna$Genus)) #distance, RNA
+
+x <- intersect(dist.da.sigtax$Genus, dist.da.rna$Genus) %>%
+  intersect(temp.da.rna$Genus) %>%
+  intersect(temp.da.sigtax$Genus)
+length(x)
+x
+```
+
+
+
+
+
+
+
+
+--- Compiling DA taxa with SIMPER taxa plots
+temp.da.sigtax
+dist.da.sigtax
+temp.da.rna
+dist.da.rna
+```{r}
+#adding in SIMPER results
+#KW.results.sig  - date comparison
+#KW.results.dis.sig - distance comparison, but 0 data were statistically sig. 
+
+x <- intersect(temp.da.sigtax$Genus, temp.da.rna$Genus) %>%
+  intersect(dist.da.sigtax$Genus) %>%
+  intersect(dist.da.rna$Genus) %>%
+  intersect(KW.results.sig$Genus)
+
+y <- c("Leptococcus JA-3-3Ab", "Meiothermus", "Geitlerinema PCC-8501", "Tepidimonas", "Rivularia PCC-7116", "Thermocrinis", "Chloracidobacterium", "GBChlB", "Tuwongella", "Chloroflexus", "Thermoflexibacter", "Lewinella")
+
+intersect(x, y)
+c(setdiff(x, y), setdiff(y, x))
+length(x)
+x
+```
+
+Filtering down data to only include taxa that were stat sig in all tests. Using vector x above.
+Making plots with % relative abundance do will use Biofilm.SMU.Source.BA.N and SMU.RNA.BA.N
+```{r}
+#DNA Data
+DNA.subset <- Biofilm.SMU.Source.BA.N %>%
+  subset_samples(Distance_from_spring_ft %in% c("0", "3", "6", "9", "12", "15")) %>%
+  microViz::tax_fix()
+tax_table(DNA.subset)@.Data <- substring(tax_table(DNA.subset)@.Data[,1:7], 4) #trim first 3 characters in the string across the df
+DNA.subset <- DNA.subset %>%
+  subset_taxa(Genus %in% x) %>%
+  tax_glom(taxrank = "Genus", NArm = FALSE)
+DNA.melt <- psmelt(DNA.subset) %>%
+  mutate(Distance_from_spring_ft = factor(.$Distance_from_spring_ft, levels = c("0", "3", "6", "9", "12", "15"))) %>%
+  filter(Abundance != 0) %>%
+  relocate(Genus, .after = OTU)
+write.csv(DNA.melt,"/Users/kalen/Documents/Dissertation/Chapter_1/Figures/DNA.melt.csv", row.names = FALSE)
+
+#RNA Data
+RNA.subset <- SMU.RNA.BA.N %>%
+  microViz::tax_fix()
+tax_table(RNA.subset)@.Data <- substring(tax_table(RNA.subset)@.Data[,1:7], 4) #trim first 3 characters in the string across the df
+RNA.subset <- RNA.subset %>%
+  subset_taxa(Genus %in% x) %>%
+  tax_glom(taxrank = "Genus", NArm = FALSE)
+RNA.melt <- psmelt(RNA.subset) %>%
+  mutate(Sample = gsub("_R", "", .$Sample),
+         Distance_from_spring_ft = as.character(Distance_from_spring_ft),
+         Distance_from_spring_ft = factor(.$Distance_from_spring_ft, levels = c("0", "3", "6", "9", "12", "15"))) %>%
+  rename(cDNA_Abundance = Abundance) %>%
+  filter(cDNA_Abundance != 0)
+```
+
+Dataframe of punative metabolisms
+```{r}
+putmet <- readxl::read_excel("/Users/kalen/Documents/YNP_Project/16S/SC_Overall/punative_metabolisms.xlsx") %>%
+  mutate(Genus = str_replace_all(Genus, "_", " "))
+
+# pm2 <- data.frame(Genus = c('Chloroflexus','Leptococcus JA-3-3Ab','Raineya','Meiothermus','Chloracidobacterium',
+#                             'GBChlB','Tepidimonas','Pseudanabaenaceae Family','Geitlerinema PCC-8501','Thermoflexibacter',
+#                             'Saprospiraceae Family','WD2101 soil group Family','Tabrizicola','Methylacidiphilaceae Family','Leptolyngbya FYG'),
+#                   optima = c('anoxygenic phototroph','oxygenic phototroph','heterotroph','heterotroph','anoxygenic phototroph',
+#                              'aerobic,photoheterotroph','heterotroph','phototroph','oxygenic phototroph','heterotroph',
+#                              'heterotroph','heterotroph','aerobic photoheterotroph','chemoautotroph','oxygenic phototroph'))
+
+#desired order
+order <- c("Leptococcus JA-3-3Ab", "Geitlerinema PCC-8501", "Leptolyngbya FYG", "Pseudanabaenaceae Family", "GBChlB", "Tabrizicola",
+           "Chloroflexus", "Chloracidobacterium", "Methylacidiphilaceae Family", "Raineya", "Meiothermus", "Tepidimonas", "Thermoflexibacter",
+           "Saprospiraceae Family", "WD2101 soil group Family")
+
+#Vector of Phototrophs, Heterotrophs, and sulfur cyclers
+ph <- c("Chloracidobacterium", "Chloroflexus", "GBChlB", "Geitlerinema PCC-8501", "Leptococcus JA-3-3Ab", "Leptolyngbya FYG", "Pseudanabaenaceae Family", "Rivularia PCC-7116", "Tabrizicola")
+ht <- c("Meiothermus", "Fimbriiglobus", "Gemmataceae Family", "Lewinella", "Raineya", "Saprospiraceae Family", "Thermoflexibacter", "Tuwongella", "WD2101 soil group Family", "Tepidimonas")
+psc <- c("Chloroflexus", "Chloracidobacterium", "GBChlB") #phototrophs that can grow with sulfur species
+hsc <- c("Tepidimonas") #heterotrophic sulfur cyclers
+
+DNA.melt <- merge(DNA.melt, putmet, by = "Genus")
+RNA.melt <- merge(RNA.melt, putmet, by = "Genus")
+unique(DNA.melt$Genus)
+unique(putmet$Genus)
+setdiff(DNA.melt$Genus, putmet$Genus)
+setdiff(RNA.melt$Genus, putmet$Genus)
+
+```
+
+nice names
+```{r}
+nicenames <- c("*Leptococcus* JA-3-3Ab", "*Geitlerinema* PCC-8501", "*Leptolyngbya* FYG", "Pseudanabaenaceae Family", "*GBChlB*",
+             "*Tabrizicola*", "*Chloroflexus*", "*Chloracidobacterium*", "Methylacidiphilaceae Family", "*Raineya*", 
+             "*Meiothermus*", "*Tepidimonas*", "*Thermoflexibacter*",
+             "Saprospiraceae Family", "WD2101 soil group Family")
+```
+
+
+  #Plots for publication#
+```{r}
+DNA.melt %>%
+  mutate(Sampling_date = factor(Sampling_date, 
+                                levels = rev(c("2020-8-21", "2019-8-11", "2018-9-29", "2018-7-26", "2018-5-30", "2017-8-18", "2010-6-4")))) %>%
+  filter(Sampling_date != '2017-8-18') %>%
+  group_by(Genus, Sampling_date, Distance_from_spring_ft, overall_optima) %>%
+  summarise(mean = mean(Abundance),
+            sd = sd(Abundance),
+            n = n()) %>%
+  arrange(overall_optima) %>%
+  mutate(Genus = factor(Genus, levels = rev(order)),
+         overall_optima = factor(overall_optima, levels = c("oxygenic phototroph", "aerobic anoxygenic phototroph", "anoxygenic phototroph",
+                                                            "chemoautotroph", "heterotroph"))) %>%
+  ggplot(aes(x = Sampling_date, y = Genus, size = mean, fill = overall_optima)) +
+  geom_point(shape = 21, color = "black") +
+  scale_radius(breaks = c(0.1, 5, 10, 15, 25, 50), limits = c(0, NA), range = c(1, 9.25), 
+               trans = "sqrt", labels = c(0.1, 5, 10, 15, 25, 50), name = "Mean % Rel. \nAbundance") +
+  theme_bw() +
+  facet_wrap(~Distance_from_spring_ft, ncol = 6, 
+             labeller = as_labeller(c("0" = "0", "3" = "1", "6" = "2", "9" = "3", "12" = "4", "15" = "5"))) +
+  scale_y_discrete(labels = rev(nicenames)) + #double check that names lined up
+   theme(strip.background = element_blank(),
+          strip.text = element_text(colour = "black", size = 14),
+          axis.text.x = element_text(colour = "black", size = 10, angle = 45, hjust = 0.95),
+          axis.text.y = ggtext::element_markdown(colour = "black", size = 11.5),
+          axis.ticks = element_line(colour = "black"),
+          axis.title.x = element_text(size = 15, color = "black"),
+          axis.title.y = element_text(size = 15, color = "black"),
+         legend.text = element_text(colour = "black", size = 9),
+         legend.title = element_text(colour = "black", size = 11.5),
+          panel.border = element_rect(colour = "black", fill=NA, size=0.9)) +
+  viridis::scale_fill_viridis(name = "Putative \nMetabolism", option = "viridis", discrete=TRUE, begin = 1, end = 0) +
+  guides(fill = guide_legend(override.aes = list(size = 6))) +
+  labs(x = "Sampling Date", y = "Genus")
+
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/sigtax/DNA_abund.pdf", width = 16, height = 7)
+
+
+RNA.melt %>%
+  mutate(Sampling_date = factor(Sampling_date, 
+                                levels = rev(c("2020-8-21", "2019-8-11", "2018-9-29")))) %>%
+  group_by(Genus, Sampling_date, Distance_from_spring_ft, overall_optima) %>%
+  summarise(mean = mean(cDNA_Abundance),
+            sd = sd(cDNA_Abundance),
+            n = n()) %>%
+  arrange(overall_optima) %>%
+  mutate(Genus = factor(Genus, levels = rev(order)),
+         overall_optima = factor(overall_optima, levels = c("oxygenic phototroph", "aerobic anoxygenic phototroph", "anoxygenic phototroph",
+                                                            "chemoautotroph", "heterotroph"))) %>%
+  ggplot(aes(x = Sampling_date, y = Genus, size = mean, fill = overall_optima)) +
+  geom_point(shape = 21, color = "black") +
+  scale_radius(breaks = c(0.1, 5, 10, 15, 25, 50), limits = c(0, NA), range = c(1, 9.25), 
+               trans = "sqrt", labels = c(0.1, 5, 10, 15, 25, 50), name = "Mean % Rel. \nAbundance") +
+  theme_bw() +
+  facet_wrap(~Distance_from_spring_ft, ncol = 6, 
+             labeller = as_labeller(c("0" = "0", "3" = "1", "6" = "2", "9" = "3", "12" = "4", "15" = "5"))) +
+  scale_y_discrete(labels = rev(nicenames)) + #double check that names lined up
+   theme(strip.background = element_blank(),
+          strip.text = element_text(colour = "black", size = 14),
+          axis.text.x = element_text(colour = "black", size = 10, angle = 45, hjust = 0.95),
+          axis.text.y = ggtext::element_markdown(colour = "black", size = 11.5),
+          axis.ticks = element_line(colour = "black"),
+          axis.title.x = element_text(size = 15, color = "black"),
+          axis.title.y = element_text(size = 15, color = "black"),
+         legend.text = element_text(colour = "black", size = 9),
+         legend.title = element_text(colour = "black", size = 11.5),
+          panel.border = element_rect(colour = "black", fill=NA, size=0.9)) +
+  viridis::scale_fill_viridis(name = "Putative \nMetabolism", option = "viridis", discrete=TRUE, begin = 1, end = 0) +
+  guides(fill = guide_legend(override.aes = list(size = 6))) +
+  labs(x = "Sampling Date", y = "Genus")
+
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/sigtax/RNA_abund.pdf", width = 10, height = 5.75)
+```
+
+---Heatmaps
+Using the percent relative abundance data sets for heatmap construction
+```{r}
+library(ampvis2)
+library(cowplot)
+library(tidyverse)
+source("/Users/kalen/Documents/Bioinformatics/phyloseq_to_ampvis2.R") #fucntion that converts a phyloseq object into an ampvis2 object. Found at https://gist.github.com/KasperSkytte/8d0ca4206a66be7ff6d76fc4ab8e66c6.
+```
+
+Creating needed ampvis2 objects for heatmap construction
+```{r}
+SMU.Water.av <- phyloseq_to_ampvis2(Water.SMU.BA.N)
+KB.Water.av <- phyloseq_to_ampvis2(Water.KB.BA.N)
+SMU.av <- phyloseq_to_ampvis2(SMU.Mat.BA.N)
+SMU.Source.av <- phyloseq_to_ampvis2(Biofilm.SMU.Source.BA.N)
+KB.av <- phyloseq_to_ampvis2(Biofilm.KB.BA.N)
+SMU.RNA.av <- SMU.RNA.BA.N %>%
+  microViz::tax_fix() %>%
+  phyloseq_to_ampvis2()
+lith.av <- phyloseq_to_ampvis2(subset_samples(Lith.BA.N, Sample_Site_type != 'Rockfall'))
+rockfall.av <- phyloseq_to_ampvis2(subset_samples(Lith.BA.N, Sample_Site_type == 'Rockfall'))
+source.av <- phyloseq_to_ampvis2(subset_samples(Overall.BA.N, Transect == 'Source'))
+
+
+SMU.Source.avfix <- Biofilm.SMU.Source.BA.N %>%
+  microViz::tax_fix() %>%
+  phyloseq_to_ampvis2()
+```
+
+Nice names 
+```{r}
+dna.names <- c('Deinococcota; *Meiothermus*',
+'Cyanobacteria; *Leptococcus* JA-3-3Ab',
+'Acidobacteriota; *Chloracidobacterium*',
+'Aquificota; *Thermocrinis*',
+'Chloroflexi; *Chloroflexus*',
+'Cyanobacteria; *Geitlerinema* PCC-8501',
+'Bacteroidota; *GBChlB*',
+'Chloroflexi; *Roseiflexus*',
+'Proteobacteria; *Tepidimonas*',
+'Bacteroidota; *Raineya*',
+'Chloroflexi; A4b Family',
+'Deinococcota; *Thermus*',
+'Planctomycetota; WD2101 soil group Family',
+'Cyanobacteria; Pseudanabaenaceae Family',
+'Bacteroidota; *Lewinella*')
+
+rna.names <- c('Cyanobacteria; *Leptococcus* JA-3-3Ab',
+'Deinococcota; *Meiothermus*',
+'Cyanobacteria; *Geitlerinema* PCC-8501',
+'Proteobacteria; *Tepidimonas*',
+'Cyanobacteria; *Rivularia* PCC-7116',
+'Bacteroidota; *Raineya*',
+'Aquificota; *Thermocrinis*',
+'Acidobacteriota; *Chloracidobacterium*',
+'Bacteroidota; *GBChlB*',
+'Planctomycetota; *Tuwongella*',
+'Cyanobacteria; *Leptolyngbya* FYG',
+'Cyanobacteria; Pseudanabaenaceae Family',
+'Chloroflexi; *Chloroflexus*',
+'Bacteroidota; *Thermoflexibacter*',
+'Chloroflexi; A4b Family')
+```
+
+
+SMU equal distances for each sampling date, From Source to end of SMU
+```{r}
+SMU.Source.avfix2 <- SMU.Source.avfix
+SMU.Source.avfix2$metadata <- SMU.Source.avfix2$metadata %>%
+  mutate(Distance_from_spring_ft = case_when(Distance_from_spring_ft == "0" ~ "0",
+                                             Distance_from_spring_ft == "3" ~ "1",
+                                             Distance_from_spring_ft == "6" ~ "2",
+                                             Distance_from_spring_ft == "9" ~ "3",
+                                             Distance_from_spring_ft == "12" ~ "4",
+                                             Distance_from_spring_ft == "15" ~ "5"))
+
+SMUS.15.HM <- amp_heatmap(amp_subset_samples(SMU.Source.avfix2, 
+                                              (Distance_from_spring_ft %in% c("0", "1", "2", "3", "4", "5"))&(Sampling_date != "2017-8-18")),
+                          tax_aggregate = "Genus",
+                          tax_add = "Phylum",
+                          group_by = "Distance_from_spring_ft", facet_by = "Sampling_date",
+                          tax_show = 15, color_vector = c("#4393c3", "#f7f7f7", "#d46240"),
+                          tax_empty = "best", 
+                          plot_values = TRUE,
+                          plot_legendbreaks = c(0.1,1.0,10.0,25.0,70.0),
+                          max_abundance = 70, min_abundance = .1,
+                          normalise = FALSE,
+                          textmap = FALSE) +
+  scale_y_discrete(labels = rev(dna.names)) + #double check that names lined up
+  theme(axis.text.x = element_text(size = 15, color = "black", hjust = 0.4, angle = 0), 
+        axis.text.y = ggtext::element_markdown(size = 15, color = "black", angle = 0), 
+        legend.text = element_text(size = 13, colour = 'black'), 
+        legend.title = element_text(size = 15, color = 'black'), 
+        strip.text.x = element_text(size = 15, color = 'Black'), 
+        strip.background.x = element_rect(fill = "White"), 
+        legend.key.size = unit(1.2, "cm")) 
+  #+ scale_x_discrete(labels = c("0" = "0", "3" = "1", "6" = "2", "9" = "3", "12" = "4", "15" = "5"))
+
+SMUS.15.HM$labels$x <- "Distance From Source (m)" #change x axis label  
+print(SMUS.15.HM) 
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/Top15HM.pdf", width = 18, height = 8)
+```
+
+% of community captured
+```{r}
+x <- amp_heatmap(amp_subset_samples(SMU.Source.avfix2, 
+                                              (Distance_from_spring_ft %in% c("0", "1", "2", "3", "4", "5"))&(Sampling_date != "2017-8-18")),
+                          tax_aggregate = "Genus",
+                          tax_add = "Phylum",
+                          group_by = "Distance_from_spring_ft", facet_by = "Sampling_date",
+                          tax_show = 15, color_vector = c("#4393c3", "#f7f7f7", "#d46240"),
+                          tax_empty = "best", 
+                          plot_values = TRUE,
+                          plot_legendbreaks = c(0.1,1.0,10.0,25.0,70.0),
+                          max_abundance = 70, min_abundance = .1,
+                          normalise = FALSE,
+                          textmap = TRUE) %>%
+  as_tibble() %>%
+  summarise_all(funs(sum))
+View(x)
+```
+
+SMU RNA down transect
+```{r}
+SMU.RNA.av$metadata <- SMU.RNA.av$metadata %>%
+  mutate(Distance_from_spring_ft = case_when(Distance_from_spring_ft == "3" ~ "1",
+                                             Distance_from_spring_ft == "6" ~ "2",
+                                             Distance_from_spring_ft == "9" ~ "3",
+                                             Distance_from_spring_ft == "12" ~ "4",
+                                             Distance_from_spring_ft == "15" ~ "5"))
+                          
+                          
+                          
+RNA.HM <- amp_heatmap(data = SMU.RNA.av,
+                                tax_aggregate = "Genus",
+                          tax_add = "Phylum",
+                          group_by = "Distance_from_spring_ft", facet_by = "Sampling_date",
+                          tax_show = 15, color_vector = c("#4393c3", "#f7f7f7", "#d46240"),
+                          tax_empty = "best", 
+                          plot_values = TRUE,
+                          plot_legendbreaks = c(0.1,1.0,10.0,25.0,70.0),
+                          max_abundance = 70, min_abundance = .1,
+                          normalise = FALSE,
+                      textmap = FALSE) +
+  scale_y_discrete(labels = rev(rna.names)) + #double check that names lined up
+  theme(axis.text.x = element_text(size = 15, color = "black", hjust = 0.4, angle = 0), 
+        axis.text.y = ggtext::element_markdown(size = 15, color = "black", angle = 0),  
+        legend.text = element_text(size = 13, colour = 'black'), 
+        legend.title = element_text(size = 15, color = 'black'), 
+        strip.text.x = element_text(size = 15, color = 'Black'), 
+        strip.background.x = element_rect(fill = "White"), 
+        legend.key.size = unit(1.2, "cm"))
+RNA.HM$labels$x <- "Distance From Source (m)" #change x axis label
+RNA.HM$labels$fill <- "% Relative\nAbundance" #change legend label
+print(RNA.HM)
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/Top15HMRNA.pdf", width = 12, height = 6)
+```
+
+
+
+
+---DNA vs. cDNA analysis
+First I need to convert the phyloseq objects into dataframes that I can more easily manipulate. 
+```{r}
+library(metagMisc)
+library(tidyverse)
+library(phyloseq)
+library(cowplot)
+```
+
+Vectors containing genera of interest
+```{r}
+top15 <- c("Meiothermus", "Leptococcus JA-3-3Ab", "Chloracidobacterium", "Thermocrinis", "Chloroflexus", "Geitlerinema PCC-8501", "GBChlB", "Roseiflexus", "Tepidimonas", "Raineya", "A4b Family", "Thermus", "WD2101 soil group Family", "Pseudanabaenaceae Family", "Lewinella", "Rivularia PCC-7116") #top 15 #left out "Tuwongella" and "Leptolyngbya FYG"
+
+top7 <- c("Meiothermus", "Leptococcus JA-3-3Ab", "Chloracidobacterium", "Thermocrinis", "Chloroflexus", "Geitlerinema PCC-8501", "GBChlB", "Rivularia PCC-7116") #top 7 most abundant taxa
+
+sigtax <- intersect(temp.da.sigtax$Genus, temp.da.rna$Genus) %>%
+  intersect(dist.da.sigtax$Genus) %>%
+  intersect(dist.da.rna$Genus) %>%
+  intersect(KW.results.sig$Genus) #taxa determined to be statistically sig in DA and SIMPER analysis
+
+not15 <- c(setdiff(sigtax, top15), setdiff(top15, sigtax)) #taxa stat sig, but not in top 12
+not7 <- c(setdiff(sigtax, top7), setdiff(top7, sigtax)) #taxa stat sig, but not in top 7
+
+taxall <- c(sigtax, top15) %>%
+  unique()
+```
+
+Prepping Data
+Using SMU.RNA.BA.N for the cDNA set 
+Using SMU.DNARNA.BA.N for the corresponding DNA set
+```{r}
+#DNA Data
+DNA.subset <- SMU.DNARNA.BA.N %>%
+  subset_samples( Amplicon !='rRNA') %>%
+  microViz::tax_fix()
+tax_table(DNA.subset)@.Data <- substring(tax_table(DNA.subset)@.Data[,1:7], 4) #trim first 3 characters in the string across the df
+DNA.subset <- DNA.subset %>%
+  subset_taxa(Genus %in% taxall) %>%
+  tax_glom(taxrank = "Genus", NArm = FALSE)
+DNA.melt <- psmelt(DNA.subset)
+
+#RNA Data
+RNA.subset <- SMU.RNA.BA.N %>%
+  microViz::tax_fix()
+tax_table(RNA.subset)@.Data <- substring(tax_table(RNA.subset)@.Data[,1:7], 4) #trim first 3 characters in the string across the df
+RNA.subset <- RNA.subset %>%
+  subset_taxa(Genus %in% taxall) %>%
+  tax_glom(taxrank = "Genus", NArm = FALSE)
+RNA.melt <- psmelt(RNA.subset) %>%
+  mutate(Sample = gsub("_R", "", .$Sample)) %>%
+  rename(cDNA_Abundance = Abundance) %>%
+  select(Sample, cDNA_Abundance, Genus) 
+
+#Combining and simplifying
+DNAcDNA.melt <- merge(DNA.melt, RNA.melt, by = c("Sample", "Genus")) %>%
+  select(Sample, Genus, Abundance, cDNA_Abundance, Sampling_date, Distance_from_spring_ft, Replicate_Number) %>%
+  mutate(Distance_from_spring_ft = as.character(Distance_from_spring_ft)) #need to convert genus to character or factor, abundnace and cDNA_Abundance to numerics if incorrect. 
+  
+#Calculating Means and St.dev.
+DNAcDNA <- DNAcDNA.melt %>%
+  group_by(Genus, Sampling_date, Distance_from_spring_ft) %>%
+  summarise(avg.dna = mean(Abundance),
+            avg.cdna = mean(cDNA_Abundance),
+            n = n(), 
+            sd.dna = sd(Abundance),
+            sd.cdna = sd(cDNA_Abundance),
+            se.dna = sd.dna/sqrt(n),
+            se.cdna = sd.cdna/sqrt(n)) %>%
+  filter(avg.dna != 0 & avg.cdna != 0) # Filtering entries where both RNA and DNA abundance is 0. 
+```
+Good to move forward with DNAcDNA df. 
+
+nice names
+```{r}
+nice7 <- c("*Meiothermus*", "*Leptococcus* JA-3-3Ab", "*Chloracidobacterium*", "*Thermocrinis*", "*Chloroflexus*", "*Geitlerinema* PCC-8501", "*GBChlB*", "*Rivularia* PCC-7116")
+```
+
+
+Plot of top 7
+```{r}
+b <- DNAcDNA %>%
+  filter(Genus %in% top7) %>%
+  mutate(Genus = str_replace(Genus, "^(\\S*)", "*\\1*")) %>% #adding in * around the first full string before a space.
+  ggplot(aes(y = avg.cdna, x = avg.dna)) +
+  geom_abline(intercept =0, slope = 1, linetype = "dashed", color = "grey2") +
+  geom_point(size = 3) + aes(colour = Genus, shape = Sampling_date) + 
+  geom_errorbarh(aes(xmin = avg.dna - sd.dna, xmax = avg.dna + sd.dna)) + 
+  geom_errorbar(aes(ymin = avg.cdna - sd.cdna, ymax = avg.cdna + sd.cdna)) + 
+  theme_bw() +
+  labs(x = "% DNA", y = "% cDNA") + 
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(), 
+        panel.border = element_blank(), 
+        axis.line = element_line(color = "black"), 
+        axis.text=element_text(size=12, colour = "black"), 
+        axis.title = element_text(size=16), 
+        legend.justification = "top",
+        legend.text = ggtext::element_markdown()) +
+  guides(color = guide_legend(override.aes = list(size = 7.5, linetype=0), title = "Genus"), 
+         shape = guide_legend(override.aes = list(size = 6), title = "Sampling Date")) +
+  scale_y_continuous(breaks = seq(0,90,20)) + scale_x_continuous(breaks = seq(0,90,20)) +
+  coord_cartesian(xlim = c(0, 90), ylim = c(0, 90)) + 
+  viridis::scale_color_viridis(discrete = TRUE, option = "viridis", end = 0.95)
+```
+
+Plot of top 7, 0 to 5% zoom
+```{r}
+b2 <- DNAcDNA %>%
+  filter(Genus %in% top7) %>%
+  ggplot(aes(y = avg.cdna, x = avg.dna)) +
+  geom_abline(intercept =0, slope = 1, linetype = "dashed", color = "grey2") +
+  geom_point(size = 3) + aes(colour = Genus, shape = Sampling_date) + 
+  geom_errorbarh(aes(xmin = avg.dna - sd.dna, xmax = avg.dna + sd.dna)) + 
+  geom_errorbar(aes(ymin = avg.cdna - sd.cdna, ymax = avg.cdna + sd.cdna)) + 
+  theme_bw() +
+  labs(x = "% DNA", y = "% cDNA") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.border = element_blank(), 
+        axis.line = element_line(color = "black"), axis.text=element_text(size=12, colour = "black"), 
+        axis.title = element_blank(), legend.justification = "top", legend.position = "none") +
+  guides(color = guide_legend(override.aes = list(size = 6, linetype=0), title = "Genus"), 
+         shape = guide_legend(override.aes = list(size = 5), title = "Sampling Date")) +
+   xlim(c(0,3)) + ylim(c(0,3.5)) + #using this instead of below two options cuts out outside errorbars.
+  #scale_y_continuous(breaks = seq(0,90,10)) + scale_x_continuous(breaks = seq(0,90,10)) +
+  #coord_cartesian(xlim = c(0, 3), ylim = c(0, 3.5)) + 
+  viridis::scale_color_viridis(discrete = TRUE, option = "viridis", end = 0.95) +
+  theme(plot.background = element_rect(color = "black")) #this creates a box around the entire graph for when it's an inset. 
+#Changing axis.title = element_text(size=9) to  element_blank() to have no axis titles for inset
+```
+
+Combining overall graph with inset. 
+```{r}
+# draw into the bottom-right corner of a larger plot area + added a square over the area that is zoomed in on for the inset
+ggdraw(b) + draw_plot(b2,  0.628, 0.066, 0.36, 0.37) + 
+  annotate("rect", xmin = 0.0745, xmax = 0.108, ymin = 0.095, ymax = 0.143, alpha = 0, color= "black")
+
+ggsave("/Users/kalen/Documents/Dissertation/Chapter_1/Figures/DNAcDNA.pdf", width = 13, height = 9)
+```
+
+---Extras/Palettes
+Let's also define a few color palettes for our samples.
+```{r}
+Palette.sequential <- c("#ffffd9", "#edf8b1", "#c7e9b4", "#7fcdbb", "#41b6c4", "#1d91c0", "#225ea8", "#253494", "#081d58") #colorblind friendly
+Palette.diverging <- c('#67001f', '#b2182b', '#d6604d', '#f4a582', '#fddbc7', '#f7f7f7', '#d1e5f0', '#92c5de', '#4393c3', '#2166ac', '#053061') #colorblind friendly
+Palette.qualitative <- c('#a6cee3', '#1f78b4', '#b2df8a', '#33a02c', '#fb9a99', '#e31a1c', '#fdbf6f', '#ff7f00', '#cab2d6', '#6a3d9a', '#ffff99', '#b15928')
+Palette.transect <- c('#1b9e77', '#d95f02', '#7570b3', '#e7298a', '#66a61e', '#e6ab02')
+Palette.gradient <- c("#006600", "#0d6e00", "#1a7500", "#267d00", "#338500", "#408c00", "#4c9400", "#599c00", "#66a300", "#73ab00", "#80b200", "#8cba00", "#99c200", "#a6c900", "#b2d100", "#bfd900", "#cce000", "#d9e800", "#e6f000", "#f2f700", "#ffff00")
+Palette.gradient2 <- c("#006600", "#267d00", "#4c9400", "#73ab00", "#99c200", "#e6f000", "#ffff00")
+Palette.gradient3 <- c("#006600", "#1a7500", "#338500", "#4c9400", "#66a300", "#99c200", "#b2d100", "#cce000", "#e6f000", "#ffff00")
+Palette.gradient4 <- c("#006600", "#4c9400", "#73ab00", "#99c200", "#e6f000")
+```
+
+
+
+
